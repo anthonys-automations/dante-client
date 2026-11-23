@@ -17,6 +17,7 @@ cc -O2 -o "$W/nbconnect" "$D/nbconnect.c"
 cc -O2 -o "$W/v6check" "$D/v6check.c"
 cc -O2 -pthread -o "$W/mtstress" "$D/mtstress.c"
 cc -O2 -o "$W/readvcheck" "$D/readvcheck.c"
+cc -O2 -o "$W/gaicheck" "$D/gaicheck.c"
 
 srv() { # GATEWAY DELAY FAIL_EVERY HOST [UDP_HOST]
   stop_server
@@ -53,6 +54,12 @@ t() { # DELAY FAIL_EVERY N WAIT EXPECTED_SUCCESSES MIN_SECONDS [ENV...]
   client "$((wait + 5))" "$@" "$W/nbconnect" "$n" "$wait" "$ok" "$min"
 }
 
+gai() { # numeric IPv6 addresses with the fake resolver
+  echo "## getaddrinfo() with resolveprotocol: fake"
+  { echo "resolveprotocol: fake"; cat "$D/socks.conf"; } > "$W/socks.conf"
+  timeout 20 env SOCKS_CONF="$W/socks.conf" LD_PRELOAD="$LIB" "$W/gaicheck" \
+    2> "$W/client.err" || { cat "$W/client.err" >&2; exit 1; }
+}
 rv() { # readv(2) with several iovecs on a proxied socket
   echo "## readv() with 4 iovecs via $GW"
   srv "$GW" 0 0 "$HOST"
@@ -80,6 +87,7 @@ for HOST in 127.0.0.1 ::1; do
   rv
 done
 
+gai
 v6 127.0.0.1 127.0.0.1 127.0.0.1 4 4
 v6 ::1 ::1 ::1 6 6
 v6 ::1 ::1 127.0.0.1 6 4

@@ -1,0 +1,73 @@
+dante 1.4.4 libdsocks: numeric IPv6 addresses in getaddrinfo(3) with
+resolveprotocol: fake
+
+Applies on top of the other dante-*.patch files (it only touches
+Rgetaddrinfo() in lib/Rgethostbyname.c).
+
+With "resolveprotocol: fake", Rgetaddrinfo() passes numeric addresses to
+the system getaddrinfo() (only names are faked), but it forced
+ai_family = AF_INET for them. getaddrinfo("::") or ("::1") therefore
+failed, so a preloaded program could not resolve an IPv6 literal, e.g. to
+listen on "::". The numeric-address check also tested ai_protocol instead
+of ai_family, and with a family in the hints only tried that family: with
+ai_protocol set (e.g. IPPROTO_TCP) and AF_UNSPEC it returned fake IPv4
+addresses for "::" and even for "127.0.0.1", and "::" asked for as AF_INET
+was faked instead of failing.
+
+Numeric addresses (of either family) now go to getaddrinfo() with the
+caller's family (and AI_NUMERICHOST, so no DNS lookup happens). Names are
+still faked, as IPv4. This does not make
+IPv6 sockets socksified: a program that connects to an IPv6 literal
+connects directly.
+
+Test: test/gaicheck.c (via test/run.sh).
+
+--- a/lib/Rgethostbyname.c
++++ b/lib/Rgethostbyname.c
+@@ -225,21 +225,18 @@
+ 
+    SASSERTX(nodename != NULL);
+ 
+-   if (hints == NULL || hints->ai_protocol == PF_UNSPEC) {
+-      if (socks_inet_pton(AF_INET,  nodename, addrbuf, NULL) == 1
+-      ||  socks_inet_pton(AF_INET6, nodename, addrbuf, NULL) == 1)
+-         isipaddr = 1;
+-      else
+-         isipaddr = 0;
+-   }
+-   else {
+-      SASSERTX(hints != NULL);
+-
+-      if (socks_inet_pton(hints->ai_family, nodename, addrbuf, NULL) == 1)
+-         isipaddr = 1;
+-      else
+-         isipaddr = 0;
+-   }
++   /*
++    * Either family, whatever hints->ai_family says: an IPv6 literal asked
++    * for as AF_INET must fail in getaddrinfo() below, not be faked as a
++    * name.  (This tested hints->ai_protocol == PF_UNSPEC and otherwise only
++    * hints->ai_family, so e.g. "::" or "127.0.0.1" with IPPROTO_TCP and
++    * AF_UNSPEC were faked.)
++    */
++   if (socks_inet_pton(AF_INET,  nodename, addrbuf, NULL) == 1
++   ||  socks_inet_pton(AF_INET6, nodename, addrbuf, NULL) == 1)
++      isipaddr = 1;
++   else
++      isipaddr = 0;
+ 
+    if (isipaddr) {
+       fakeip_cantry = 0;
+@@ -275,7 +272,12 @@
+ 
+             /*
+              * With AI_NUMERICHOST this should not result in any DNS lookup.
++             * Keep the caller's family: an IPv6 literal (e.g., "::" for a
++             * listening socket) is not something we fake, and forcing
++             * AF_INET made getaddrinfo() fail for it.  Only names are
++             * faked, and those always as IPv4.
+              */
++            fakehints.ai_family = hints == NULL ? AF_UNSPEC : hints->ai_family;
+             gaierr = getaddrinfo(nodename, servname, &fakehints, res);
+ 
+             slog(LOG_DEBUG, "%s: getaddrinfo(%s, %s) returned %d (%s)",

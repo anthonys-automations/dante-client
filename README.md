@@ -64,13 +64,18 @@ and enforce network policy separately if proxy use is mandatory.
   sockets, which upstream turned into short reads or received data written
   over the caller's stack (seen as `__stack_chk_fail` crashes in libevent's
   `evbuffer_read()`).
+- With `resolveprotocol: fake`, numeric addresses of either family resolve
+  normally (the getaddrinfo patch), so a preloaded program can listen on
+  `::`; names are still faked as IPv4. Upstream failed `getaddrinfo("::")`
+  and, with `ai_protocol` set, faked even IPv4 literals.
 - The library requests a 2 MiB default thread stack for musl, including
   threads in the preloaded application.
 
 See the [worker patch](dante-connectchild-workers.patch),
 [IPv6 patch](dante-ipv6-gateway.patch),
-[threads patch](dante-threads.patch) and
-[readv patch](dante-readv-iovcnt.patch) for implementation details.
+[threads patch](dante-threads.patch),
+[readv patch](dante-readv-iovcnt.patch) and
+[getaddrinfo patch](dante-gai-numeric-ipv6.patch) for implementation details.
 
 ## Build and test
 
@@ -85,8 +90,9 @@ The build requires IPv4 and IPv6 loopback, including the `ip6-localhost` name,
 in the isolated BuildKit test stage. A blocked connect, unexpected success or
 failure count, pending request, failed TCP/UDP gateway check, a crash,
 extra connect-child or stall in the multithreaded churn test
-(`test/mtstress.c`), or a short or misplaced `readv(2)`
-(`test/readvcheck.c`) stops the build. Test tools stay out of the final image.
+(`test/mtstress.c`), a short or misplaced `readv(2)`
+(`test/readvcheck.c`), or a numeric address the fake resolver mishandles
+(`test/gaicheck.c`) stops the build. Test tools stay out of the final image.
 
 See [image builds and versioning](docs/image-versioning.md) for release tags,
 publication, and Renovate. Repository code is licensed under
