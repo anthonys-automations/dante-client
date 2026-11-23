@@ -1,8 +1,49 @@
 # libdsocks: SOCKS servers reachable over IPv6 (design notes)
 
-Status: investigated, not implemented. Notes for a follow-up patch on top of
-[dante-connectchild-workers.patch](dante-connectchild-workers.patch).
+Status: implemented in [dante-ipv6-gateway.patch](dante-ipv6-gateway.patch),
+on top of [dante-connectchild-workers.patch](dante-connectchild-workers.patch).
+Tested by [test/run.sh](test/run.sh) with [test/v6check.c](test/v6check.c).
+The design notes below are kept as written; see
+[Implementation notes](#implementation-notes) for where the patch differs.
 Line numbers refer to dante 1.4.4.
+
+## Implementation notes
+
+- **The client rejected IPv6 gateways.** The grammar accepts `via: ::1`, but
+  `socks_addroute()` (`lib/config.c:288`) allowed `SOCKS_ADDR_IPV6` gateways
+  only in the server (`#if !SOCKS_CLIENT`) and failed with "gateway must be
+  an IP-address or qualified domainname". The patch allows them.
+- `socks_resocket()` is a new function in `lib/sockopt.c`. It does not change
+  `socketoptdup()`. It maps `IP_TOS`/`IP_TTL` only when the value differs
+  from a new socket's, so "use the default" stays the default. All other
+  `IPPROTO_IP`/`IPPROTO_IPV6` options are dropped. A wildcard bind
+  `0.0.0.0:P` becomes `[::]:P` with `IPV6_V6ONLY`, because the old socket
+  still holds the port while the new one binds.
+- `socks_connecthost()` changes only in the client build (`SOCKS_CLIENT`).
+  The client calls it only for gateways, so direct routes are not affected.
+  sockd keeps its behaviour.
+- **Non-blocking connect:** `socks_nbconnectroute()` bound the `AF_INET` dummy
+  fd to the control socket's local IP. When the control socket has become
+  IPv6, the dummy is bound to `127.0.0.1:0` instead.
+- **UDP:** the data socket is replaced *before* the UDP ASSOCIATE request,
+  to the family of the control connection. The address sent in the request
+  therefore matches the real source. If the relay address in the reply is of
+  the other family, the socket is replaced again; the source then no longer
+  matches what was announced (logged at debug level). The socket stays bound
+  (same port if possible), because `socks_addrisours()` needs a bound
+  address to recognise it on later calls. `udpsetup()` now checks for
+  "already set up" before rejecting non-`AF_INET` sockets.
+- `Rrecvfrom()` converts IPv4-mapped sources to `AF_INET`. It drops
+  datagrams whose source an `AF_INET` socket can't represent, and loops again
+  if the socket is blocking.
+- `socks_addrisours()` (`lib/address.c:552`) tested
+  `sin_addr.s_addr == 0` on IPv6 local addresses, reading
+  `sin6_flowinfo`. It now uses `IPADDRISBOUND()`.
+- **`setsockopt()` after connect:** Linux accepts `IPPROTO_IP` options such
+  as `IP_TOS` on an `AF_INET6` TCP or UDP socket without error. They only
+  affect IPv4-mapped traffic, so they have no effect on the IPv6 path to the
+  server. libdsocks does not wrap `setsockopt()` and does not translate
+  them. `getsockopt(SO_DOMAIN)` on a replaced fd returns `AF_INET6`.
 
 ## Goal and scope
 

@@ -8,6 +8,7 @@ on:
     paths:
       - Dockerfile
       - dante-connectchild-workers.patch
+      - dante-ipv6-gateway.patch
       - .github/workflows/build-image.yml
   schedule:
     - cron: '0 0 * * 0'

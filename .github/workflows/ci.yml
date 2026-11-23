@@ -21,7 +21,7 @@ jobs:
       - name: Build patched Dante library
         run: docker build --target dante --tag dante-test .
 
-      - name: Run non-blocking connect tests
+      - name: Run libdsocks tests (non-blocking connect, IPv6 server)
         env:
           WORKSPACE: ${{ github.workspace }}
         run: |

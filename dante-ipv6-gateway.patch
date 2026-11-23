@@ -1,0 +1,804 @@
+dante 1.4.4 libdsocks: reach SOCKS servers over IPv6 from AF_INET sockets
+
+Applies on top of dante-connectchild-workers.patch (and Alpine's ifdev,
+gaierrval and dante-no-bindresvport patches). See ipv6-proxy.md.
+
+The program's sockets stay AF_INET and are socksified as before; only the
+SOCKS server (via: an IPv6 address, or a name that resolves to IPv6) is
+reached over IPv6, for TCP connect (blocking and non-blocking) and UDP
+associate.
+
+1. config.c: the client rejected IPv6 gateways ("gateway must be an
+   IP-address or qualified domainname"). Allowed now.
+
+2. socks_resocket() (sockopt.c) replaces the socket behind an fd with one of
+   the other family, keeping the fd number, type, O_NONBLOCK, FD_CLOEXEC and
+   the SOL_SOCKET/IPPROTO_TCP options. IP_TOS/IP_TTL map to IPV6_TCLASS/
+   IPV6_UNICAST_HOPS if the program changed them; other IP-level options are
+   dropped. A wildcard bind with a fixed port keeps the port; a specific
+   (e.g. 127.0.0.1) bind is dropped (logged at debug level).
+
+3. socks_connecthost() (socket.c), client only, so only for gateways:
+   - literal gateway of the other family: resocket, then connect;
+   - name gateway: resolve both families, try the socket's own family first,
+     and resocket for addresses of the other family instead of skipping them.
+   Covers blocking connect (the program's fd), non-blocking connect (the
+   control socket, dup2()ed onto the program's fd by sigio(); the AF_INET
+   dummy fd is bound to 127.0.0.1 then) and the UDP control connection,
+   which is now created with the gateway's family.
+
+4. UDP data socket (udp.c): resocketed to the control connection's family
+   before the UDP ASSOCIATE request, so the announced address matches, and
+   again if the relay address is of the other family. udpsetup() recognises
+   the replaced socket on later calls. Rrecvfrom() converts IPv4-mapped
+   sources to AF_INET and drops datagrams whose source the program's
+   AF_INET socket can not represent (debug log).
+
+5. What the program sees: socksfd_t.origfamily records the program's family.
+   Rgetsockname() returns 0.0.0.0 with the BND port for an IPv6 BND.ADDR
+   instead of a truncated sockaddr_in6. socks_addrisours() handles IPv6
+   local addresses (it read sin_addr of a sockaddr_in6). getsockopt
+   (SO_DOMAIN) shows AF_INET6 on a replaced fd; IPv4-level setsockopt()s
+   after connect are accepted by Linux but only affect IPv4-mapped traffic.
+
+Test: test/run.sh (test/v6check.c).
+
+--- a/include/common.h
++++ b/include/common.h
+@@ -2349,6 +2349,13 @@ typedef struct {
+                                      * same as control.
+                                      */
+ 
++   sa_family_t  origfamily;         /*
++                                     * family of the program's socket.  The
++                                     * socket itself may have been replaced
++                                     * by one of the server's family.
++                                     * AF_UNSPEC if not known.
++                                     */
++
+    union {
+       sockshost_t   accepted;   /* address server accepted for us.     */
+       sockshost_t   connected;  /* address server connected to for us. */
+@@ -3604,6 +3611,27 @@ socketoptdup(int s, int new_s);
+  *      On failure: -1
+  */
+ 
++#if SOCKS_CLIENT
++#define AFNAME(af) \
++   ((af) == AF_INET ? "AF_INET" : (af) == AF_INET6 ? "AF_INET6" : "AF_?")
++
++int
++socks_resocket(int s, sa_family_t af);
++/*
++ * Replaces the socket behind fd "s" with a new socket of family "af"
++ * (AF_INET or AF_INET6), keeping the fd number, the socket type, the file
++ * status and descriptor flags, and the socket options that make sense in
++ * "af" (IP_TOS <-> IPV6_TCLASS, IP_TTL <-> IPV6_UNICAST_HOPS).
++ * A wildcard local address with a fixed port is carried over; a specific
++ * local address is dropped.
++ * Does nothing if "s" already is of family "af".
++ *
++ * Returns:
++ *      On success: 0.
++ *      On failure: -1, with errno set.  "s" is unchanged.
++ */
++#endif /* SOCKS_CLIENT */
++
+ void
+ socketoptioncheck(const socketoption_t *option);
+ /*
+--- a/lib/Rbind.c
++++ b/lib/Rbind.c
+@@ -133,6 +133,7 @@ Rbind(s, _name, namelen)
+    }
+ 
+    bzero(&socksfd, sizeof(socksfd));
++   socksfd.origfamily = TOSA(name)->sa_family;
+ 
+    if ((socksfd.route = socks_requestpolish(&packet.req, NULL, NULL)) == NULL) {
+       /*
+--- a/lib/Rconnect.c
++++ b/lib/Rconnect.c
+@@ -278,6 +278,8 @@ Rconnect(s, _name, namelen)
+    if (getsockname(s, TOSA(&socksfd.local), &len) != 0)
+       return -1;
+ 
++   socksfd.origfamily = socksfd.local.ss_family;
++
+    slog(LOG_DEBUG, "%s: local address of fd %d is %s",
+         function, s, sockaddr2string(&socksfd.local, NULL, 0));
+ 
+--- a/lib/Rgetsockname.c
++++ b/lib/Rgetsockname.c
+@@ -202,6 +202,27 @@ Rgetsockname(s, name, namelen)
+       }
+    }
+ 
++   if (socksfd.origfamily == AF_INET && addr.ss_family != AF_INET) {
++      /*
++       * The program has an AF_INET socket and can not use an address of
++       * another family (e.g., from a server reached over IPv6).  Keep the
++       * port and make the address unknown.
++       */
++      const in_port_t port = GET_SOCKADDRPORT(&addr);
++
++      slog(LOG_DEBUG, "%s: fd %d: presenting %s as 0.0.0.0.%u to the "
++                      "program's AF_INET socket",
++           function,
++           s,
++           sockaddr2string(&addr, NULL, 0),
++           (unsigned)ntohs(port));
++
++      bzero(&addr, sizeof(addr));
++      SET_SOCKADDR(&addr, AF_INET);
++      TOIN(&addr)->sin_addr.s_addr = htonl(INADDR_ANY);
++      TOIN(&addr)->sin_port        = port;
++   }
++
+    *namelen = MIN(*namelen, salen(addr.ss_family));
+    sockaddrcpy(TOSS(name), &addr, (size_t)*namelen);
+ 
+--- a/lib/address.c
++++ b/lib/address.c
+@@ -549,7 +549,7 @@ socks_addrisours(s, socksfdmatch, takelock)
+             break;
+          }
+ 
+-         if (TOCIN(&socksfd.local)->sin_addr.s_addr == htonl(0)) {
++         if (!IPADDRISBOUND(&socksfd.local)) {
+             /*
+              * if address was not bound before, it might have become
+              * later, after client did a send(2) or similar.
+@@ -582,7 +582,11 @@ socks_addrisours(s, socksfdmatch, takelock)
+             }
+             else {
+                nsocksfd = socksfd;
+-               TOIN(&nsocksfd.local)->sin_addr = TOIN(&local)->sin_addr;
++               if (local.ss_family == AF_INET6
++               &&  nsocksfd.local.ss_family == AF_INET6)
++                  TOIN6(&nsocksfd.local)->sin6_addr = TOIN6(&local)->sin6_addr;
++               else
++                  TOIN(&nsocksfd.local)->sin_addr = TOIN(&local)->sin_addr;
+                socksfd = *socks_addaddr(s, &nsocksfd, 0);
+             }
+          }
+--- a/lib/config.c
++++ b/lib/config.c
+@@ -286,9 +286,7 @@ socks_addroute(newroute, last)
+    else {
+       switch (route->gw.addr.atype) {
+          case SOCKS_ADDR_IPV4:
+-#if !SOCKS_CLIENT
+-         case SOCKS_ADDR_IPV6:
+-#endif /* !SOCKS_CLIENT */
++         case SOCKS_ADDR_IPV6: /* client: see socks_resocket(). */
+             break;
+ 
+          case SOCKS_ADDR_DOMAIN:
+--- a/lib/connectchild.c
++++ b/lib/connectchild.c
+@@ -604,6 +604,18 @@ socks_nbconnectroute(s, control, packet, src, dst, emsg, emsglen)
+       SASSERTX(PORTISBOUND(TOIN(&local)));
+       TOIN(&local)->sin_port = htons(0);
+ 
++      if (local.ss_family != AF_INET) {
++         /*
++          * control was replaced by a socket of the server's family, which
++          * the AF_INET dummy can not bind to.  Any unique local address
++          * will do.
++          */
++         bzero(&local, sizeof(local));
++         SET_SOCKADDR(&local, AF_INET);
++         TOIN(&local)->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++         TOIN(&local)->sin_port        = htons(0);
++      }
++
+       if (socks_bind(s, TOSS(&local), 0) != 0) {
+          snprintf(emsg, emsglen,
+                   "could not bind address (%s) for control-fd %d: %s",
+@@ -629,6 +641,7 @@ socks_nbconnectroute(s, control, packet, src, dst, emsg, emsglen)
+     * we receive when our connect-child is done.
+     */
+    socksfd.control             = control;
++   socksfd.origfamily          = socksfd.local.ss_family;
+    socksfd.state.command       = packet->req.command;
+    socksfd.state.version       = packet->req.version;
+    socksfd.state.protocol.tcp  = 1;
+--- a/lib/socket.c
++++ b/lib/socket.c
+@@ -47,6 +47,15 @@
+ static const char rcsid[] =
+ "$Id: socket.c,v 1.218.4.7.2.7.4.3 2020/11/11 16:11:54 karls Exp $";
+ 
++#if SOCKS_CLIENT
++static struct addrinfo *
++addrinfo_familyfirst(struct addrinfo *ai, const int family);
++/*
++ * Reorders the list "ai" so that addresses of family "family" come first,
++ * otherwise keeping the order.  Returns the new head of the list.
++ */
++#endif /* SOCKS_CLIENT */
++
+ int
+ socks_connecthost(s,
+ #if !SOCKS_CLIENT
+@@ -132,6 +141,40 @@ socks_connecthost(s,
+       case SOCKS_ADDR_IPV6: {
+          int connect_errno, flags, changed_to_nonblocking;
+ 
++#if SOCKS_CLIENT
++         /*
++          * In the client we only get here to connect to a proxy server (direct
++          * routes never come here), and the program's socket may be of the
++          * other family than the server.  Replace it with one that can reach
++          * the server.
++          */
++         const sa_family_t af
++         = host->atype == SOCKS_ADDR_IPV4 ? AF_INET : AF_INET6;
++
++         if (laddr->ss_family != af) {
++            if (socks_resocket(s, af) != 0) {
++               snprintf(emsg, emsglen,
++                        "could not replace fd %d with an %s socket to reach "
++                        "%s: %s",
++                        s,
++                        AFNAME(af),
++                        hoststr,
++                        strerror(errno));
++
++               return -1;
++            }
++
++            len = sizeof(*laddr);
++            if (getsockname(s, TOSA(laddr), &len) == -1) {
++               snprintf(emsg, emsglen, "getsockname(2) failed: %s",
++                        strerror(errno));
++               return -1;
++            }
++
++            sockaddr2string(laddr, laddrstr, sizeof(laddrstr));
++         }
++#endif /* SOCKS_CLIENT */
++
+          changed_to_nonblocking = 0;
+          flags                  = -1;
+ 
+@@ -347,12 +390,16 @@ socks_connecthost(s,
+           * to request it includes IPv4-mapped IPv6 addresses, converted to
+           * regular IPv4 addresses.
+           */
++#if SOCKS_CLIENT
++         hints.ai_family = 0; /* can use both; see socks_resocket(). */
++#else /* !SOCKS_CLIENT */
+          if (laddr->ss_family == AF_INET)
+             hints.ai_family = 0; /* or we will not get the IPv4-mapped IPv6. */
+          else {
+             SASSERTX(laddr->ss_family == AF_INET6);
+             hints.ai_family = laddr->ss_family;
+          }
++#endif /* !SOCKS_CLIENT */
+ 
+          len = sizeof(hints.ai_socktype);
+          if (getsockopt(s, SOL_SOCKET, SO_TYPE, &hints.ai_socktype, &len) != 0){
+@@ -393,6 +440,10 @@ socks_connecthost(s,
+    SASSERTX(host->atype == SOCKS_ADDR_DOMAIN);
+    SASSERTX(res->ai_addr != NULL);
+ 
++#if SOCKS_CLIENT
++   res = addrinfo_familyfirst(res, laddr->ss_family);
++#endif /* SOCKS_CLIENT */
++
+    /*
+     * try all ipaddresses hostname resolved to.
+     */
+@@ -403,6 +454,29 @@ socks_connecthost(s,
+       sockshost_t newhost;
+ 
+       if (next->ai_family != laddr->ss_family) {
++#if SOCKS_CLIENT
++         if (socks_resocket(s, next->ai_family) != 0) {
++            snprintf(emsg, emsglen,
++                     "could not replace fd %d with an %s socket to reach "
++                     "%s (resolved from %s): %s",
++                     s,
++                     AFNAME(next->ai_family),
++                     sockaddr2string(TOSS(next->ai_addr), NULL, 0),
++                     hoststr,
++                     strerror(errno));
++
++            return -1;
++         }
++
++         len = sizeof(*laddr);
++         if (getsockname(s, TOSA(laddr), &len) == -1) {
++            snprintf(emsg, emsglen, "getsockname(2) failed: %s",
++                     strerror(errno));
++            return -1;
++         }
++      }
++      else if (failed) {
++#else /* !SOCKS_CLIENT */
+          snprintf(emsg, emsglen,
+                   "can not attempt connect to address %s (resolved from %s) "
+                   "from our %s-socket on the external side",
+@@ -415,7 +489,9 @@ socks_connecthost(s,
+          continue;
+       }
+ 
+-      if (failed) { /* previously failed, need to create a new socket. */
++      if (failed) {
++#endif /* !SOCKS_CLIENT */
++         /* previously failed, need to create a new socket. */
+          int new_s;
+ 
+          if ((new_s = socketoptdup(s, -1)) == -1) {
+@@ -527,6 +603,33 @@ socks_connecthost(s,
+    return -1;
+ }
+ 
++#if SOCKS_CLIENT
++static struct addrinfo *
++addrinfo_familyfirst(ai, family)
++   struct addrinfo *ai;
++   const int family;
++{
++   struct addrinfo *first = NULL, **firstnext = &first,
++                   *rest  = NULL, **restnext  = &rest;
++
++   for (; ai != NULL; ai = ai->ai_next) {
++      if (ai->ai_family == family) {
++         *firstnext = ai;
++         firstnext  = &ai->ai_next;
++      }
++      else {
++         *restnext = ai;
++         restnext  = &ai->ai_next;
++      }
++   }
++
++   *restnext  = NULL;
++   *firstnext = rest;
++
++   return first;
++}
++#endif /* SOCKS_CLIENT */
++
+ #undef socket
+ int
+ socks_socket(domain, type, protocol)
+--- a/lib/sockopt.c
++++ b/lib/sockopt.c
+@@ -122,6 +122,182 @@ socketoptdup(s, new_s)
+    return new_s;
+ }
+ 
++#if SOCKS_CLIENT
++
++/* IP-level options with an equivalent in the other family. */
++static const struct {
++   int         level4, optname4, level6, optname6;
++   const char  *optstr;
++} ipoptmap[] = {
++   { IPPROTO_IP, IP_TOS, IPPROTO_IPV6, IPV6_TCLASS,       "IP_TOS"   },
++   { IPPROTO_IP, IP_TTL, IPPROTO_IPV6, IPV6_UNICAST_HOPS, "IP_TTL"   },
++};
++
++int
++socks_resocket(s, af)
++   int s;
++   sa_family_t af;
++{
++   const char *function = "socks_resocket()";
++   struct sockaddr_storage local, newlocal;
++   socketoptvalue_t val, defval;
++   socklen_t len, deflen;
++   unsigned int i;
++   int new_s, ref_s, type, flags, fdflags, errno_s;
++
++   if (af != AF_INET && af != AF_INET6) {
++      errno = EAFNOSUPPORT;
++      return -1;
++   }
++
++   len = sizeof(local);
++   if (getsockname(s, TOSA(&local), &len) == -1)
++      return -1;
++
++   if (local.ss_family == af)
++      return 0;
++
++   if (local.ss_family != AF_INET && local.ss_family != AF_INET6) {
++      errno = EAFNOSUPPORT;
++      return -1;
++   }
++
++   len = sizeof(type);
++   if (getsockopt(s, SOL_SOCKET, SO_TYPE, &type, &len) == -1)
++      return -1;
++
++   if ((flags   = fcntl(s, F_GETFL, 0)) == -1
++   ||  (fdflags = fcntl(s, F_GETFD, 0)) == -1)
++      return -1;
++
++   slog(LOG_DEBUG, "%s: replacing fd %d (local %s) with an %s socket",
++        function, s, sockaddr2string(&local, NULL, 0), AFNAME(af));
++
++   if ((new_s = socket(af, type, 0)) == -1)
++      return -1;
++
++   for (i = 0; i < HAVE_DUPSOCKOPT_MAX; ++i) {
++      if (option[i].level == IPPROTO_IP
++#ifdef IPPROTO_IPV6
++      ||  option[i].level == IPPROTO_IPV6
++#endif /* IPPROTO_IPV6 */
++      )
++         continue; /* family-specific, see ipoptmap. */
++
++      len = sizeof(val);
++      if (getsockopt(s, option[i].level, option[i].optname, &val, &len) == -1)
++         continue;
++
++      if (setsockopt(new_s, option[i].level, option[i].optname, &val, len)
++      == -1)
++         if (errno != ENOPROTOOPT)
++            slog(LOG_DEBUG, "%s: setsockopt(%s) failed: %s",
++                 function, option[i].optstr, strerror(errno));
++   }
++
++   /*
++    * Only carry over IP-level values the program changed, i.e., that differ
++    * from those of a new socket.  Otherwise we would replace "use the
++    * default" with a fixed value.
++    */
++   ref_s = socket(local.ss_family, type, 0);
++
++   for (i = 0; i < ELEMENTS(ipoptmap); ++i) {
++      const int fromlevel = local.ss_family == AF_INET ?
++                              ipoptmap[i].level4 : ipoptmap[i].level6;
++      const int fromopt   = local.ss_family == AF_INET ?
++                              ipoptmap[i].optname4 : ipoptmap[i].optname6;
++      const int tolevel   = af == AF_INET ?
++                              ipoptmap[i].level4 : ipoptmap[i].level6;
++      const int toopt     = af == AF_INET ?
++                              ipoptmap[i].optname4 : ipoptmap[i].optname6;
++
++      len = sizeof(val.int_val);
++      if (getsockopt(s, fromlevel, fromopt, &val.int_val, &len) == -1)
++         continue;
++
++      deflen = sizeof(defval.int_val);
++      if (ref_s != -1
++      &&  getsockopt(ref_s, fromlevel, fromopt, &defval.int_val, &deflen) == 0
++      &&  defval.int_val == val.int_val)
++         continue;
++
++      if (setsockopt(new_s, tolevel, toopt, &val.int_val, len) == -1)
++         slog(LOG_DEBUG, "%s: could not carry %s (%d) over to the %s socket: %s",
++              function,
++              ipoptmap[i].optstr,
++              val.int_val,
++              AFNAME(af),
++              strerror(errno));
++      else
++         slog(LOG_DEBUG, "%s: carried %s (%d) over to the %s socket",
++              function, ipoptmap[i].optstr, val.int_val, AFNAME(af));
++   }
++
++   if (ref_s != -1)
++      close(ref_s);
++
++   if (fcntl(new_s, F_SETFL, flags) == -1)
++      goto fail;
++
++   if (PORTISBOUND(&local) && !IPADDRISBOUND(&local)) {
++      /*
++       * Program bound a port on the wildcard address.  Keep the port.
++       * The old socket still holds it, so IPV6_V6ONLY is needed for the
++       * IPv6 socket not to collide with it.
++       */
++      bzero(&newlocal, sizeof(newlocal));
++      SET_SOCKADDR(&newlocal, af);
++      if (af == AF_INET)
++         TOIN(&newlocal)->sin_addr.s_addr = htonl(INADDR_ANY);
++      else {
++         const int one = 1;
++
++         TOIN6(&newlocal)->sin6_addr = in6addr_any;
++         if (setsockopt(new_s, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one))
++         == -1)
++            slog(LOG_DEBUG, "%s: setsockopt(IPV6_V6ONLY) failed: %s",
++                 function, strerror(errno));
++      }
++
++      SET_SOCKADDRPORT(&newlocal, GET_SOCKADDRPORT(&local));
++
++      if (bind(new_s, TOSA(&newlocal), salen(newlocal.ss_family)) == -1) {
++         swarn("%s: could not bind %s for fd %d",
++               function, sockaddr2string(&newlocal, NULL, 0), s);
++         goto fail;
++      }
++   }
++   else if (IPADDRISBOUND(&local))
++      slog(LOG_DEBUG,
++           "%s: fd %d was bound to %s.  That address is not usable on an "
++           "%s socket, so the new socket is left unbound",
++           function,
++           s,
++           sockaddr2string(&local, NULL, 0),
++           AFNAME(af));
++
++   if (dup2(new_s, s) == -1)
++      goto fail;
++
++   close(new_s);
++
++   if (fcntl(s, F_SETFD, fdflags) == -1)
++      slog(LOG_DEBUG, "%s: fcntl(F_SETFD) on fd %d failed: %s",
++           function, s, strerror(errno));
++
++   return 0;
++
++fail:
++   errno_s = errno;
++   close(new_s);
++   errno = errno_s;
++
++   return -1;
++}
++
++#endif /* SOCKS_CLIENT */
++
+ #if DEBUG
+ void
+ printsocketopts(s)
+--- a/lib/udp.c
++++ b/lib/udp.c
+@@ -552,6 +552,7 @@ again:
+ 
+       /* replace "newfrom" with the address socks server says packet is from. */
+       fakesockshost2sockaddr(&header.host, &newfrom);
++      newfromlen = salen(newfrom.ss_family);
+ 
+       /* callee doesn't want socks header. */
+       n -= (ssize_t)HEADERSIZE_UDP(&header);
+@@ -570,6 +571,47 @@ again:
+ 
+    SASSERTX(n >= 0);
+ 
++   if (socksfd.origfamily == AF_INET
++   &&  newfrom.ss_family  == AF_INET6
++   &&  IN6_IS_ADDR_V4MAPPED(&TOIN6(&newfrom)->sin6_addr)) {
++      /* our replacement AF_INET6 socket got it from an IPv4 address. */
++      struct sockaddr_storage ipv4;
++
++      bzero(&ipv4, sizeof(ipv4));
++      SET_SOCKADDR(&ipv4, AF_INET);
++      memcpy(&TOIN(&ipv4)->sin_addr,
++             &TOIN6(&newfrom)->sin6_addr.s6_addr[12],
++             sizeof(TOIN(&ipv4)->sin_addr));
++      TOIN(&ipv4)->sin_port = TOIN6(&newfrom)->sin6_port;
++
++      newfrom    = ipv4;
++      newfromlen = salen(newfrom.ss_family);
++   }
++
++   if (socksfd.origfamily != AF_UNSPEC
++   &&  newfrom.ss_family  != socksfd.origfamily) {
++      /*
++       * Can not be represented in the program's socket address.  Can happen
++       * if we replaced the program's socket with one of another family to
++       * reach the proxy server (see socks_resocket()).
++       */
++      slog(LOG_DEBUG,
++           "%s: dropping packet from %s on fd %d, as the address is not of "
++           "the family of the program's socket (%s)",
++           function,
++           sockaddr2string(&newfrom, srcstr, sizeof(srcstr)),
++           s,
++           AFNAME(socksfd.origfamily));
++
++      free(newbuf);
++
++      if (fdisblocking(s))
++         goto again;
++
++      errno = EAGAIN;
++      return -1;
++   }
++
+    if (socksfd.state.udpconnect) {
+       /*
+        * Need to filter out packets that are not from the address the
+@@ -655,6 +697,68 @@ again:
+    return MIN(len, (size_t)n);
+ }
+ 
++static int
++udp_resocket(const int s, const sa_family_t af,
++             struct sockaddr_storage *local, char *emsg, const size_t emsglen)
++{
++   const char *function = "udp_resocket()";
++   const in_port_t oldport = GET_SOCKADDRPORT(local);
++   socklen_t len;
++
++   slog(LOG_DEBUG, "%s: replacing fd %d (%s) with an %s socket",
++        function, s, sockaddr2string(local, NULL, 0), AFNAME(af));
++
++   if (socks_resocket(s, af) != 0) {
++      snprintf(emsg, emsglen,
++               "could not replace fd %d with an %s socket: %s",
++               s, AFNAME(af), strerror(errno));
++      return -1;
++   }
++
++   len = sizeof(*local);
++   if (getsockname(s, TOSA(local), &len) != 0) {
++      snprintf(emsg, emsglen, "getsockname() on fd %d (s) failed: %s",
++               s, strerror(errno));
++      return -1;
++   }
++
++   if (oldport != htons(0) && !PORTISBOUND(local)) {
++      /*
++       * The old socket was bound to an address not usable with "af".
++       * Keep the port if we can, and the socket bound in any case, as we
++       * need a fixed address to recognize the socket as ours later.
++       */
++      bzero(local, sizeof(*local));
++      SET_SOCKADDR(local, af);
++      if (af == AF_INET)
++         TOIN(local)->sin_addr.s_addr = htonl(INADDR_ANY);
++      else
++         TOIN6(local)->sin6_addr = in6addr_any;
++
++      SET_SOCKADDRPORT(local, oldport);
++      if (bind(s, TOSA(local), salen(af)) != 0) {
++         slog(LOG_DEBUG, "%s: could not bind fd %d to %s (%s), using any port",
++              function, s, sockaddr2string(local, NULL, 0), strerror(errno));
++
++         SET_SOCKADDRPORT(local, htons(0));
++         if (bind(s, TOSA(local), salen(af)) != 0) {
++            snprintf(emsg, emsglen, "bind() of fd %d (s) to %s failed: %s",
++                     s, sockaddr2string(local, NULL, 0), strerror(errno));
++            return -1;
++         }
++      }
++
++      len = sizeof(*local);
++      if (getsockname(s, TOSA(local), &len) != 0) {
++         snprintf(emsg, emsglen, "getsockname() on fd %d (s) failed: %s",
++                  s, strerror(errno));
++         return -1;
++      }
++   }
++
++   return 0;
++}
++
+ route_t *
+ udpsetup(s, to, type, shouldconnect, emsg, emsglen)
+    int s;
+@@ -699,15 +803,10 @@ udpsetup(s, to, type, shouldconnect, emsg, emsglen)
+       slog(LOG_DEBUG, "%s: local address of fd %d is %s",
+            function, s, sockaddr2string(&addr, NULL, 0));
+ 
+-   switch (TOSA(&addr)->sa_family) {
+-      case AF_INET:
+-         break;
+-
+-      default:
+-         snprintf(emsg, emsglen, "unsupported af %d", TOSA(&addr)->sa_family);
+-         return NULL;
+-   }
+-
++   /*
++    * Check this before the address family, as we may have replaced the
++    * program's socket with one of the server's family (see socks_resocket()).
++    */
+    if (socks_addrisours(s, &socksfd, 1)) {
+       if (socksfd.state.command == SOCKS_UDPASSOCIATE) {
+          slog(LOG_DEBUG, "%s: things already set up for fd %d", function, s);
+@@ -718,6 +817,15 @@ udpsetup(s, to, type, shouldconnect, emsg, emsglen)
+               function, command2string(socksfd.state.command));
+    }
+ 
++   switch (TOSA(&addr)->sa_family) {
++      case AF_INET:
++         break;
++
++      default:
++         snprintf(emsg, emsglen, "unsupported af %d", TOSA(&addr)->sa_family);
++         return NULL;
++   }
++
+    socks_rmaddr(s, 1);
+ 
+    if (socks_socketisforlan(s)) {
+@@ -728,6 +836,7 @@ udpsetup(s, to, type, shouldconnect, emsg, emsglen)
+    bzero(&socksfd, sizeof(socksfd));
+    socksfd.control = -1;
+    socksfd.local   = addr;
++   socksfd.origfamily = addr.ss_family;
+ 
+    switch (type) {
+       case SOCKS_RECV:
+@@ -844,7 +953,17 @@ udpsetup(s, to, type, shouldconnect, emsg, emsglen)
+    switch (packet.version = packet.req.version) {
+       case PROXY_SOCKS_V5:
+       case PROXY_UPNP:
+-         if ((socksfd.control = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
++         /*
++          * The data socket (s) is AF_INET, but the server may be reachable
++          * only over IPv6; create the control socket accordingly.  If the
++          * server is given by name, socks_connecthost() replaces the control
++          * socket if needed.
++          */
++         if ((socksfd.control
++         = socket(socksfd.route->gw.addr.atype == SOCKS_ADDR_IPV6 ?
++                     AF_INET6 : AF_INET,
++                  SOCK_STREAM,
++                  0)) == -1) {
+             snprintf(emsg, emsglen,
+                      "failed to create control socket: %s", strerror(errno));
+             return NULL;
+@@ -901,6 +1020,33 @@ udpsetup(s, to, type, shouldconnect, emsg, emsglen)
+    if (socksfd.route->gw.state.proxyprotocol.direct)
+       return socksfd.route;
+ 
++   if (socksfd.state.version != PROXY_UPNP) {
++      struct sockaddr_storage controladdr;
++
++      /*
++       * If the control connection is not of the same family as s, the
++       * server is presumably reachable only over that family, and s needs
++       * to be of that family too to send to the server.  Must be done before
++       * we tell the server our address.
++       */
++      len = sizeof(controladdr);
++      if (getsockname(socksfd.control, TOSA(&controladdr), &len) != 0) {
++         snprintf(emsg, emsglen, "getsockname(socksfd.control) failed: %s",
++                  strerror(errno));
++
++         close(socksfd.control);
++         return NULL;
++      }
++
++      if (controladdr.ss_family != socksfd.local.ss_family) {
++         if (udp_resocket(s, controladdr.ss_family, &socksfd.local,
++                          emsg, emsglen) != 0) {
++            close(socksfd.control);
++            return NULL;
++         }
++      }
++   }
++
+    /*
+     * we need to send the socks server our address.
+     * First check if the socket already has a name, if so
+@@ -970,6 +1116,26 @@ udpsetup(s, to, type, shouldconnect, emsg, emsglen)
+    else {
+       sockshost2sockaddr(&packet.res.host, &socksfd.reply);
+ 
++      if (socksfd.reply.ss_family != socksfd.local.ss_family) {
++         char rstr[MAXSOCKADDRSTRING], lstr[sizeof(rstr)];
++
++         slog(LOG_DEBUG,
++              "%s: server relays udp from %s, which fd %d (%s) can not reach. "
++              "Replacing fd %d, so the source address of our packets will "
++              "not match what we told the server",
++              function,
++              sockaddr2string(&socksfd.reply, rstr, sizeof(rstr)),
++              s,
++              sockaddr2string(&socksfd.local, lstr, sizeof(lstr)),
++              s);
++
++         if (udp_resocket(s, socksfd.reply.ss_family, &socksfd.local,
++                          emsg, emsglen) != 0) {
++            close(socksfd.control);
++            return NULL;
++         }
++      }
++
+       len = sizeof(socksfd.server);
+       if (getpeername(socksfd.control, TOSA(&socksfd.server), &len) != 0) {
+          snprintf(emsg, emsglen,
