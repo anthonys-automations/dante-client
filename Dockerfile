@@ -45,7 +45,3 @@ COPY --from=tested /out/libdsocks.so /usr/lib/libdsocks.so
 # Override when building a release; ad-hoc builds remain identifiable.
 ARG GIT_COMMIT=unknown
 ENV GIT_COMMIT=${GIT_COMMIT}
-# Non-root by default; the runtime may override the uid/gid.
-ARG UID=65534
-ARG GID=65534
-USER ${UID}:${GID}
