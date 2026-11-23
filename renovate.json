@@ -4,7 +4,7 @@
     "config:recommended",
     ":dependencyDashboard"
   ],
-  "description": "Updates the Alpine base image and GitHub Actions used by this repository. Releases are built and published by .github/workflows/build-image.yml.",
+  "description": "Updates the Alpine base image, Dante source release and GitHub Actions used by this repository.",
   "timezone": "Etc/UTC",
   "automerge": true,
   "automergeType": "pr",
@@ -16,7 +16,38 @@
   "labels": [
     "dependencies"
   ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^Dockerfile$/"
+      ],
+      "matchStrings": [
+        "ARG DANTE_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)\\r?\\nARG DANTE_SHA256=(?<currentDigest>[a-f0-9]{64})"
+      ],
+      "depNameTemplate": "dante",
+      "datasourceTemplate": "custom.dante",
+      "versioningTemplate": "semver",
+      "autoReplaceStringTemplate": "ARG DANTE_VERSION={{{newValue}}}\nARG DANTE_SHA256={{{newDigest}}}"
+    }
+  ],
+  "customDatasources": {
+    "dante": {
+      "defaultRegistryUrlTemplate": "https://www.inet.no/dante/download.html",
+      "format": "plain",
+      "transformTemplates": [
+        "($items := $split($join(releases.version, ' '), '<li>'); {\"releases\": [$map($items, function($item) { ($version := $match($item, /Dante ([0-9]+\\.[0-9]+\\.[0-9]+)/); $digest := $match($item, /SHA256: ([a-f0-9]{64})/); $exists($version) and $exists($digest) ? {\"version\": $version.groups[0], \"digest\": $digest.groups[0]} : undefined) })], \"homepage\": \"https://www.inet.no/dante/\"})"
+      ]
+    }
+  },
   "packageRules": [
+    {
+      "description": "Dante upgrades require review of the local patch and compatibility with Alpine's patches.",
+      "matchDatasources": [
+        "custom.dante"
+      ],
+      "automerge": false
+    },
     {
       "description": "Group Dockerfile dependency updates so one build-only validation run can gate the PR.",
       "matchManagers": [

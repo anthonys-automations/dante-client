@@ -49,9 +49,13 @@ recording the immutable image digest.
 
 ## Renovate
 
-The scheduled Renovate workflow updates the Alpine base image and pinned GitHub
-Actions. Dockerfile changes are grouped and may automerge after the
-build-only `Validate Image Build` workflow succeeds on both architectures.
+The scheduled Renovate workflow updates the Alpine base image, Dante source
+version and checksum, and pinned GitHub Actions. Dante versions and SHA-256
+checksums are taken together from the upstream download page. Dante updates
+require manual review: check the local patch, Alpine patches and runtime tests
+against the new release before merging. Alpine image changes are grouped and
+may automerge after the build-only `Validate Image Build` workflow succeeds on
+both architectures.
 GitHub Actions updates appear on Renovate's dependency dashboard for manual
 application because the workflow's built-in `GITHUB_TOKEN` cannot push changes
 to `.github/workflows`.

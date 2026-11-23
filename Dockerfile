@@ -2,8 +2,8 @@
 # /usr/lib/libdsocks.so. Add the application and its packages in a later layer.
 #   docker build -t <image>:<tag> <this directory>
 
-# libdsocks.so from dante 1.4.4, built like Alpine's package (same tarball,
-# patches and flags) plus dante-connectchild-workers.patch.
+# libdsocks.so built using Alpine's patches and flags plus
+# dante-connectchild-workers.patch.
 FROM docker.io/library/alpine:3.24 AS dante
 ARG DANTE_VERSION=1.4.4
 ARG DANTE_SHA256=1973c7732f1f9f0a4c0ccf2c1ce462c7c25060b25643ea90f9b98f53a813faec
