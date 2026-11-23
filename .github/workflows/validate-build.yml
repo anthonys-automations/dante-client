@@ -1,4 +1,4 @@
-# Build-only check dispatched for Renovate branches before automerge.
+# Build and runtime checks dispatched for Renovate branches before automerge.
 name: Validate Image Build
 
 on:
@@ -27,7 +27,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Build image (no push)
+      - name: Build and test patched image (no push)
         uses: docker/build-push-action@v7
         with:
           context: .

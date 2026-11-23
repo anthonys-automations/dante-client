@@ -52,11 +52,11 @@ recording the immutable image digest.
 
 The scheduled Renovate workflow updates the Alpine base image, Dante source
 version and checksum, and pinned GitHub Actions. Dante versions and SHA-256
-checksums are taken together from the upstream download page. Dante updates
-require manual review: check the local patches, Alpine patches and runtime tests
-against the new release before merging. Alpine image changes are grouped and
-may automerge after the build-only `Validate Image Build` workflow succeeds on
-both architectures.
+checksums are taken together from the upstream download page. Dante and Alpine
+updates are eligible for automerge after `Validate Image Build` passes on both
+architectures. Each image build applies the Alpine and local patches without
+fuzz, then runs the worker and IPv4/IPv6 gateway tests on the resulting
+library. A failure blocks the update and leaves the PR open for investigation.
 GitHub Actions updates appear on Renovate's dependency dashboard for manual
 application because the workflow's built-in `GITHUB_TOKEN` cannot push changes
 to `.github/workflows`.

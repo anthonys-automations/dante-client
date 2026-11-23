@@ -18,19 +18,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Build patched Dante library
-        run: docker build --target dante --tag dante-test .
-
-      - name: Run libdsocks tests (non-blocking connect, IPv6 server)
-        env:
-          WORKSPACE: ${{ github.workspace }}
-        run: |
-          docker run --rm \
-            --volume "${WORKSPACE}:/workspace:ro" \
-            dante-test \
-            sh -c 'apk add --no-cache coreutils python3 && /workspace/test/run.sh /out/libdsocks.so'
-
-      - name: Build final image
+      - name: Build final image and test patch compatibility
         run: docker build --build-arg GIT_COMMIT="${GITHUB_SHA}" --tag dante-client:ci .
 
       - name: Verify final image

@@ -3,7 +3,7 @@
  * report how long each connect() call blocked the calling thread, then wait
  * for all of them and count successes (SOCKS reply ok and "hello" received).
  *
- * usage: nbconnect N [WAIT_SECONDS]
+ * usage: nbconnect N WAIT_SECONDS EXPECTED_SUCCESSES MIN_SECONDS
  */
 #include <arpa/inet.h>
 #include <errno.h>
@@ -25,9 +25,14 @@ static double now(void)
 
 int main(int argc, char **argv)
 {
-   int n = argc > 1 ? atoi(argv[1]) : 50;
-   double waitmax = argc > 2 ? atof(argv[2]) : 60;
+   if (argc != 5) {
+      fprintf(stderr, "usage: nbconnect N WAIT_SECONDS EXPECTED_SUCCESSES MIN_SECONDS\n");
+      return 2;
+   }
+   int n = atoi(argv[1]), successes = atoi(argv[3]);
+   double waitmax = atof(argv[2]), minwait = atof(argv[4]);
    int *fd = calloc(n, sizeof(int)), *state = calloc(n, sizeof(int));
+   size_t *received = calloc(n, sizeof(*received));
    double start = now(), maxblock = 0, sumblock = 0;
    int i, connected = 0, failed = 0, inprogress = 0, immediate_fail = 0;
 
@@ -36,20 +41,23 @@ int main(int argc, char **argv)
       double t0, dt;
 
       fd[i] = socket(AF_INET, SOCK_STREAM, 0);
-      fcntl(fd[i], F_SETFL, fcntl(fd[i], F_GETFL) | O_NONBLOCK);
+      if (fd[i] == -1 || fcntl(fd[i], F_SETFL, O_NONBLOCK) == -1) {
+         perror("non-blocking socket");
+         return 1;
+      }
       memset(&sin, 0, sizeof(sin));
       sin.sin_family = AF_INET;
       sin.sin_port   = htons(6881 + i);
       sin.sin_addr.s_addr = htonl(0xc0000201 + (i % 200)); /* 192.0.2.x */
 
       t0 = now();
-      if (connect(fd[i], (struct sockaddr *)&sin, sizeof(sin)) == 0)
-         state[i] = 1;
-      else if (errno == EINPROGRESS)
-         ++inprogress;
-      else {
-         state[i] = -1;
-         ++immediate_fail;
+      if (connect(fd[i], (struct sockaddr *)&sin, sizeof(sin)) < 0) {
+         if (errno == EINPROGRESS)
+            ++inprogress;
+         else {
+            state[i] = -1;
+            ++immediate_fail;
+         }
       }
       dt = now() - t0;
       sumblock += dt;
@@ -77,15 +85,23 @@ int main(int argc, char **argv)
       }
       poll(pfd, n, 200);
       for (i = 0; i < n; ++i) {
-         char buf[64];
+         static const char hello[] = "hello\n";
+         char buf[sizeof(hello)];
          ssize_t r;
 
          if (state[i] != 0 || pfd[i].revents == 0)
             continue;
-         r = recv(fd[i], buf, sizeof(buf), 0);
-         if (r > 0 && memmem(buf, r, "hello", 5) != NULL)
-            state[i] = 1;
-         else if (r == 0 || (r < 0 && errno != EAGAIN))
+         r = recv(fd[i], buf, sizeof(hello) - 1 - received[i], 0);
+         if (r > 0) {
+            if (memcmp(buf, hello + received[i], r) != 0) {
+               fprintf(stderr, "unexpected proxy greeting on connection %d\n", i);
+               return 1;
+            }
+            received[i] += r;
+            if (received[i] == sizeof(hello) - 1)
+               state[i] = 1;
+         }
+         else if (r == 0 || (errno != EAGAIN && errno != EINTR))
             state[i] = -1;
       }
       free(pfd);
@@ -97,7 +113,12 @@ int main(int argc, char **argv)
    printf("after %.1fs: success %d, failed %d, still pending %d\n",
           now() - start, connected, failed, n - connected - failed);
    fflush(stdout);
-   if (argc > 3)
-      sleep(atoi(argv[3])); /* linger: keep the mother alive for inspection */
+   if (connected != successes || failed != n - successes ||
+       maxblock >= 1.0 || now() - start < minwait) {
+      fprintf(stderr, "expected %d successes, %d failures, no pending, "
+              "connect() under 1s and completion after at least %.1fs\n",
+              successes, n - successes, minwait);
+      return 1;
+   }
    return 0;
 }

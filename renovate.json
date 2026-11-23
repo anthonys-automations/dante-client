@@ -42,14 +42,7 @@
   },
   "packageRules": [
     {
-      "description": "Dante upgrades require review of the local patch and compatibility with Alpine's patches.",
-      "matchDatasources": [
-        "custom.dante"
-      ],
-      "automerge": false
-    },
-    {
-      "description": "Group Dockerfile dependency updates so one build-only validation run can gate the PR.",
+      "description": "Group Dockerfile dependency updates for image compatibility validation.",
       "matchManagers": [
         "dockerfile"
       ],

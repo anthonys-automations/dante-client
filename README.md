@@ -62,24 +62,17 @@ See the [IPv6 patch](dante-ipv6-gateway.patch) and
 
 ## Build and test
 
-Build the final image locally:
+Build the final image locally, including the same patch compatibility checks
+used for CI, Renovate updates and releases:
 
 ```sh
 docker build -t dante-client:local .
 ```
 
-Run the loopback tests as CI does (requires Docker and IPv6 loopback for the
-IPv6 cases):
-
-```sh
-docker build --target dante -t dante-test .
-docker run --rm -v "$PWD:/workspace:ro" dante-test \
-  sh -c 'apk add --no-cache coreutils python3 && /workspace/test/run.sh /out/libdsocks.so'
-```
-
-The test script skips IPv6 or IPv6-name cases when their prerequisites are
-unavailable. The IPv6 checks fail the script on errors; the non-blocking
-scenarios print their results for inspection.
+The build requires IPv4 and IPv6 loopback, including the `ip6-localhost` name,
+in the isolated BuildKit test stage. A blocked connect, unexpected success or
+failure count, pending request, or failed TCP/UDP gateway check stops the
+build. Test tools stay out of the final image.
 
 See [image builds and versioning](docs/image-versioning.md) for release tags,
 publication, and Renovate. Repository code is licensed under

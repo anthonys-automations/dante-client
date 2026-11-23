@@ -24,9 +24,9 @@ WORKDIR /src/dante-${DANTE_VERSION}
 # overflows that. musl takes the default thread stack size from the largest
 # PT_GNU_STACK among the program and its startup libraries, LD_PRELOAD
 # included, so 2 MiB here applies to every thread of the preloaded program.
-RUN for p in ifdev gaierrval dante-no-bindresvport; do patch -p1 < "../${p}.patch"; done \
- && patch -p1 < ../dante-connectchild-workers.patch \
- && patch -p1 < ../dante-ipv6-gateway.patch \
+RUN for p in ifdev gaierrval dante-no-bindresvport dante-connectchild-workers dante-ipv6-gateway; do \
+      patch --batch --forward --fuzz=0 -p1 < "../${p}.patch" || exit 1; \
+    done \
  && CFLAGS="-Os -fstack-clash-protection -Wformat -Werror=format-security -Wno-implicit-function-declaration -D_GNU_SOURCE" \
     LDFLAGS="-Wl,-z,stack-size=2097152" \
     ac_cv_func_sched_setscheduler=no ./configure --prefix=/usr \
@@ -35,8 +35,13 @@ RUN for p in ifdev gaierrval dante-no-bindresvport; do patch -p1 < "../${p}.patc
  && strip --strip-unneeded /out/libdsocks.so \
  && readelf -lW /out/libdsocks.so | grep -q 'GNU_STACK.* 0x200000 RW'
 
+FROM dante AS tested
+RUN apk add --no-cache coreutils python3
+COPY test/ /test/
+RUN --network=none /test/run.sh /out/libdsocks.so
+
 FROM docker.io/library/alpine:3.24
-COPY --from=dante /out/libdsocks.so /usr/lib/libdsocks.so
+COPY --from=tested /out/libdsocks.so /usr/lib/libdsocks.so
 # Override when building a release; ad-hoc builds remain identifiable.
 ARG GIT_COMMIT=unknown
 ENV GIT_COMMIT=${GIT_COMMIT}

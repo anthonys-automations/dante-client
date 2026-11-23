@@ -86,12 +86,14 @@ tcp(int tcpfamily, const char *bindto)
    struct sockaddr_storage ss;
    struct stat before, after;
    socklen_t len;
-   int s, tos = 0x10, val, inport = 0;
+   int s, tos = 0x10, ttl = 42, val, inport = 0;
 
    printf("## tcp, bind: %s\n", bindto);
 
    s = socket(AF_INET, SOCK_STREAM, 0);
    CHECK(setsockopt(s, IPPROTO_IP, IP_TOS, &tos, sizeof(tos)) == 0,
+         "%s", strerror(errno));
+   CHECK(setsockopt(s, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl)) == 0,
          "%s", strerror(errno));
    CHECK(fcntl(s, F_SETFD, FD_CLOEXEC) == 0, "%s", strerror(errno));
 
@@ -122,6 +124,10 @@ tcp(int tcpfamily, const char *bindto)
    CHECK((fcntl(s, F_GETFL) & O_NONBLOCK) == 0, "became non-blocking");
 
    if (tcpfamily == 6) {
+      len = sizeof(val);
+      val = -1;
+      CHECK(getsockopt(s, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &val, &len) == 0
+            && val == ttl, "IPV6_UNICAST_HOPS is %d", val);
       len = sizeof(val);
       val = -1;
       CHECK(getsockopt(s, IPPROTO_IPV6, IPV6_TCLASS, &val, &len) == 0
@@ -191,8 +197,8 @@ static void
 udpcheck(int s, int port, const char *msg)
 {
    struct sockaddr_in to = testnet(port), from;
-   socklen_t fromlen;
-   char buf[64];
+   socklen_t fromlen = 0;
+   char buf[64] = "";
 
    CHECK(sendto(s, msg, strlen(msg), 0, (struct sockaddr *)&to, sizeof(to))
          == (ssize_t)strlen(msg), "sendto: %s", strerror(errno));

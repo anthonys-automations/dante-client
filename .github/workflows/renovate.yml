@@ -140,7 +140,7 @@ jobs:
       # Nothing the bot pushes starts a workflow run, so a renovate/* branch
       # carries no status and automerge would wait forever. An explicitly
       # dispatched workflow_dispatch run *is* allowed, so trigger the
-      # build-only validation here; its check lands on the branch head and the
+      # image build and runtime validation here; its checks land on the branch head and the
       # next Renovate run merges the PR once it is green. This keeps the merge
       # gated on a real build rather than on `ignoreTests`.
       - name: Dispatch build validation on Renovate branches
