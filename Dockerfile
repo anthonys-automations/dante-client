@@ -1,7 +1,6 @@
-# Alpine image with a patched dante libdsocks.so (/usr/lib/libdsocks.so), for
-# running one program under LD_PRELOAD with its sockets sent through SOCKS.
-# The application comes from Alpine packages (PACKAGES, required).
-#   docker build --build-arg PACKAGES="<apk packages>" -t <image>:<tag> <this directory>
+# Minimal Alpine image with a patched dante libdsocks.so at
+# /usr/lib/libdsocks.so. Add the application and its packages in a later layer.
+#   docker build -t <image>:<tag> <this directory>
 
 # libdsocks.so from dante 1.4.4, built like Alpine's package (same tarball,
 # patches and flags) plus dante-connectchild-workers.patch.
@@ -36,11 +35,10 @@ RUN for p in ifdev gaierrval dante-no-bindresvport; do patch -p1 < "../${p}.patc
  && readelf -lW /out/libdsocks.so | grep -q 'GNU_STACK.* 0x200000 RW'
 
 FROM docker.io/library/alpine:3.24
-ARG PACKAGES
-# No dante package: only libdsocks.so is used.
-RUN test -n "${PACKAGES}" || { echo "set --build-arg PACKAGES" >&2; exit 1; } \
- && apk add --no-cache ${PACKAGES}
 COPY --from=dante /out/libdsocks.so /usr/lib/libdsocks.so
+# Override when building a release; ad-hoc builds remain identifiable.
+ARG GIT_COMMIT=unknown
+ENV GIT_COMMIT=${GIT_COMMIT}
 # Non-root by default; the runtime may override the uid/gid.
 ARG UID=65534
 ARG GID=65534

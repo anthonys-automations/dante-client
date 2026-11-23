@@ -1,0 +1,215 @@
+# Build and publish the libdsocks Alpine image for Docker Hub.
+name: Build and Publish Image
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - Dockerfile
+      - dante-connectchild-workers.patch
+      - .github/workflows/build-image.yml
+  schedule:
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dante-client-release
+  cancel-in-progress: false
+
+env:
+  IMAGE: anthonysautomations/dante-client
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      base_image: ${{ steps.meta.outputs.base_image }}
+      created: ${{ steps.meta.outputs.created }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Allocate and verify release tag
+        id: version
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${DOCKERHUB_USERNAME}" || -z "${DOCKERHUB_TOKEN}" ]]; then
+            echo "::error::Set DOCKERHUB_USERNAME and DOCKERHUB_TOKEN repository secrets."
+            exit 1
+          fi
+
+          version="$(date -u +'%Y.%m.%d').${GITHUB_RUN_NUMBER}"
+          auth_token=$(curl -fsS \
+            --user "${DOCKERHUB_USERNAME}:${DOCKERHUB_TOKEN}" \
+            --get \
+            --data-urlencode 'service=registry.docker.io' \
+            --data-urlencode "scope=repository:${IMAGE}:pull" \
+            https://auth.docker.io/token | jq -er '.token')
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${auth_token}" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://registry-1.docker.io/v2/${IMAGE}/manifests/${version}")
+
+          if [[ "${status}" == 200 ]]; then
+            echo "::error::Release tag ${IMAGE}:${version} already exists; start a new workflow run instead of rerunning this one."
+            exit 1
+          elif [[ "${status}" != 404 ]]; then
+            echo "::error::Could not verify release tag ${IMAGE}:${version} (registry returned HTTP ${status})."
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Collect image metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          base_image=$(awk '$1 == "FROM" { print $2; exit }' Dockerfile)
+          if [[ -z "${base_image}" ]]; then
+            echo "::error::Could not determine the base image from Dockerfile."
+            exit 1
+          fi
+          echo "base_image=${base_image}" >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          sbom: true
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.title=dante-client
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.created=${{ needs.prepare.outputs.created }}
+            io.anthonysautomations.base.image=${{ needs.prepare.outputs.base_image }}
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest='${{ steps.build.outputs.digest }}'
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Verify and publish release manifest
+        run: |
+          set -euo pipefail
+          expected_count=$(awk -F, '{ print NF }' <<< "${PLATFORMS}")
+          digest_count=$(find /tmp/digests -type f | wc -l)
+          if [[ "${digest_count}" -ne "${expected_count}" ]]; then
+            echo "::error::Expected ${expected_count} architecture digests, found ${digest_count}."
+            exit 1
+          fi
+
+          refs=()
+          for digest_file in /tmp/digests/*; do
+            refs+=("${IMAGE}@sha256:$(basename "${digest_file}")")
+          done
+          annotations=(
+            --annotation "index:org.opencontainers.image.title=dante-client"
+            --annotation "index:org.opencontainers.image.version=${{ needs.prepare.outputs.version }}"
+            --annotation "index:org.opencontainers.image.revision=${{ github.sha }}"
+            --annotation "index:org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
+            --annotation "index:org.opencontainers.image.created=${{ needs.prepare.outputs.created }}"
+          )
+
+          docker buildx imagetools create --dry-run \
+            "${annotations[@]}" "${refs[@]}" > /tmp/release-manifest.json
+          covered_platforms=$(jq -r '[.manifests[] | select(.platform != null and .platform.os != "unknown")
+                     | .platform.os + "/" + .platform.architecture]
+                     | unique | join(",")' /tmp/release-manifest.json)
+          expected_platforms=$(tr ',' '\n' <<< "${PLATFORMS}" | sort | paste -sd, -)
+          if [[ "${covered_platforms}" != "${expected_platforms}" ]]; then
+            echo "::error::Candidate manifest covers [${covered_platforms}], expected [${expected_platforms}]."
+            exit 1
+          fi
+
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${{ needs.prepare.outputs.version }}" \
+            "${annotations[@]}" "${refs[@]}"
+          docker buildx imagetools create \
+            --tag "${IMAGE}:latest" \
+            "${IMAGE}:${{ needs.prepare.outputs.version }}"
+
+          {
+            echo "## Build Summary"
+            echo "- **Image:** ${IMAGE}"
+            echo "- **Platforms:** ${covered_platforms}"
+            echo "- **Immutable release:** [${{ needs.prepare.outputs.version }}](https://hub.docker.com/layers/${IMAGE}/${{ needs.prepare.outputs.version }}/)"
+            echo "- **Moving alias:** latest"
+            echo "- **Base image:** ${{ needs.prepare.outputs.base_image }}"
+            echo "- **Commit:** ${{ github.sha }}"
+          } >> "$GITHUB_STEP_SUMMARY"

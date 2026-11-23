@@ -1,0 +1,40 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard"
+  ],
+  "description": "Updates the Alpine base image and GitHub Actions used by this repository. Releases are built and published by .github/workflows/build-image.yml.",
+  "timezone": "Etc/UTC",
+  "automerge": true,
+  "automergeType": "pr",
+  "platformAutomerge": false,
+  "prCreation": "immediate",
+  "prHourlyLimit": 0,
+  "rebaseWhen": "behind-base-branch",
+  "separateMajorMinor": false,
+  "labels": [
+    "dependencies"
+  ],
+  "packageRules": [
+    {
+      "description": "Group Dockerfile dependency updates so one build-only validation run can gate the PR.",
+      "matchManagers": [
+        "dockerfile"
+      ],
+      "groupName": "all dependencies",
+      "automerge": true
+    },
+    {
+      "description": "GitHub Actions updates are listed on the dependency dashboard for manual application because GITHUB_TOKEN cannot push changes under .github/workflows.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "automerge": false,
+      "dependencyDashboardApproval": true
+    }
+  ],
+  "vulnerabilityAlerts": {
+    "enabled": false
+  }
+}

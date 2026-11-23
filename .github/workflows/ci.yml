@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Build patched Dante library
+        run: docker build --target dante --tag dante-test .
+
+      - name: Run non-blocking connect tests
+        env:
+          WORKSPACE: ${{ github.workspace }}
+        run: |
+          docker run --rm \
+            --volume "${WORKSPACE}:/workspace:ro" \
+            dante-test \
+            sh -c 'apk add --no-cache coreutils python3 && /workspace/test/run.sh /out/libdsocks.so'
+
+      - name: Build final image
+        run: docker build --build-arg GIT_COMMIT="${GITHUB_SHA}" --tag dante-client:ci .
+
+      - name: Verify final image
+        run: |
+          docker run --rm dante-client:ci sh -ec \
+            'test -r /usr/lib/libdsocks.so && test "$GIT_COMMIT" = "$1"' -- "${GITHUB_SHA}"
