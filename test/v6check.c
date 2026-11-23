@@ -1,6 +1,6 @@
 /*
  * Checks that an AF_INET program works through libdsocks whatever the
- * family of the SOCKS server (see ipv6-proxy.md), against slowsocks.py.
+ * family of the SOCKS server (see README.md), against slowsocks.py.
  *
  * usage: v6check TCP_FAMILY UDP_FAMILY    (4 or 6)
  * The families are those the sockets must end up with to reach the server:

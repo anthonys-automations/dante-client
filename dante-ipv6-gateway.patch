@@ -1,7 +1,7 @@
 dante 1.4.4 libdsocks: reach SOCKS servers over IPv6 from AF_INET sockets
 
 Applies on top of dante-connectchild-workers.patch (and Alpine's ifdev,
-gaierrval and dante-no-bindresvport patches). See ipv6-proxy.md.
+gaierrval and dante-no-bindresvport patches). See README.md.
 
 The program's sockets stay AF_INET and are socksified as before; only the
 SOCKS server (via: an IPv6 address, or a name that resolves to IPv6) is
