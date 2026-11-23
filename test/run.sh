@@ -15,6 +15,8 @@ stop_server() {
 trap 'stop_server; rm -rf "$W"' EXIT
 cc -O2 -o "$W/nbconnect" "$D/nbconnect.c"
 cc -O2 -o "$W/v6check" "$D/v6check.c"
+cc -O2 -pthread -o "$W/mtstress" "$D/mtstress.c"
+cc -O2 -o "$W/readvcheck" "$D/readvcheck.c"
 
 srv() { # GATEWAY DELAY FAIL_EVERY HOST [UDP_HOST]
   stop_server
@@ -51,6 +53,16 @@ t() { # DELAY FAIL_EVERY N WAIT EXPECTED_SUCCESSES MIN_SECONDS [ENV...]
   client "$((wait + 5))" "$@" "$W/nbconnect" "$n" "$wait" "$ok" "$min"
 }
 
+rv() { # readv(2) with several iovecs on a proxied socket
+  echo "## readv() with 4 iovecs via $GW"
+  srv "$GW" 0 0 "$HOST"
+  client 20 "$W/readvcheck"
+}
+mt() { # threads racing for the connect-child, short waits, fd reuse
+  echo "## 8 threads churning non-blocking connects via $GW (one connect-child)"
+  srv "$GW" 2 0 "$HOST"
+  client 40 SOCKS_CONNECTCHILD_MAXWORKERS=20 "$W/mtstress" 8 10 50
+}
 v6() { # GATEWAY HOST UDP_HOST TCP_FAMILY UDP_FAMILY
   echo "## TCP and UDP via $1 (relay $3)"
   srv "$1" 0 0 "$2" "$3"
@@ -64,6 +76,8 @@ for HOST in 127.0.0.1 ::1; do
   t 60 0 20 8 0 2 SOCKS_CONNECTCHILD_TIMEOUT=3
   t 2 3 30 10 20 0
   t 6 0 500 20 128 0
+  mt
+  rv
 done
 
 v6 127.0.0.1 127.0.0.1 127.0.0.1 4 4

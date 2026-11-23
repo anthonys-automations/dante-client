@@ -1,0 +1,238 @@
+dante 1.4.4 libdsocks: non-blocking connects from several threads
+
+Applies on top of dante-connectchild-workers.patch and
+dante-ipv6-gateway.patch (and Alpine's ifdev, gaierrval and
+dante-no-bindresvport patches).
+
+Two races in the mother (the program's process) that crash or wedge
+threaded programs doing non-blocking connects from more than one thread,
+or receiving SIGIO on more than one. Reproduced with test/mtstress.c
+(8 threads churning connects, short waits, fd reuse): SIGSEGV or SIGABRT
+within seconds, e.g. sigio() asserting on dup2(2) EBADF, socks_addaddr()
+asserting on a corrupted table entry, and in a real program heap/stack
+corruption (musl __stack_chk_fail).
+
+1. The connect-child was created lazily without serialization: several
+   threads making their first non-blocking connect at the same time each
+   forked one and overwrote sockscf.child_data/child_ack. Replies from the
+   other children were never read, their connects never finished, and the
+   children were orphaned. A mutex now covers the check and the creation.
+
+2. socks_addrlock() skipped the thread mutex whenever sockscf.state.insignal
+   was set (an OpenBSD workaround). That flag is process-wide, so while any
+   thread ran sigio() no thread was locked out of the address table, and
+   SIGIO can be delivered to (and sigio() run on) several threads at once.
+   Now:
+   - sigio() runs the handler with the address lock held, so one instance
+     runs at a time and other threads stay out of the table meanwhile; an
+     instance that waited still drains the replies;
+   - socks_addrlock() takes the mutex in the handler too (except on
+     OpenBSD), and the mutex is recursive for the functions sigio() calls
+     that lock themselves. A thread holding the lock has all signals
+     blocked, so the handler never runs on the thread holding it.
+
+Test: test/mtstress.c (via test/run.sh).
+
+--- a/lib/connectchild.c
++++ b/lib/connectchild.c
+@@ -77,11 +77,15 @@
+ #define MAXPACKETSQUEUED   (10)
+ 
+ static void sigio(int sig, siginfo_t *sip, void *scp);
++static void sigio_locked(int sig, siginfo_t *sip, void *scp);
+ static void run_connectchild(const int mother_data, const int mother_ack)
+             __ATTRIBUTE__((noreturn));
+ 
+ static struct sigaction       originalhandler;
+ static volatile sig_atomic_t  reqoutstanding;
++#if HAVE_PTHREAD_H
++static pthread_mutex_t        connectchild_mutex = PTHREAD_MUTEX_INITIALIZER;
++#endif /* HAVE_PTHREAD_H */
+ 
+ /*
+  * Concurrent connect-child.
+@@ -188,6 +192,17 @@
+    else
+       slog(LOG_DEBUG, "%s: our signal handler already installed", function);
+ 
++#if HAVE_PTHREAD_H
++   /*
++    * Several threads of the program can get here at the same time with
++    * their first non-blocking connect.  Only one may create the
++    * connect-child: each would otherwise fork its own and overwrite
++    * sockscf.child_data/child_ack, leaving the others' replies unread
++    * (their connects never finish) and their processes orphaned.
++    */
++   pthread_mutex_lock(&connectchild_mutex);
++#endif /* HAVE_PTHREAD_H */
++
+    if (sockscf.connectchild == 0) {
+       /*
+        * Create child process that will do our connections.
+@@ -202,7 +217,7 @@
+                   strerror(errno));
+ 
+          swarnx("%s: %s", function, emsg);
+-         return NULL;
++         goto connectchild_failed;
+       }
+       else
+          slog(LOG_DEBUG, "%s: socketpair(SOCK_DGRAM) returned %d, %d",
+@@ -213,7 +228,7 @@
+                   strerror(errno));
+ 
+          swarnx("%s: %s", function, emsg);
+-         return NULL;
++         goto connectchild_failed;
+       }
+       else
+          slog(LOG_DEBUG, "%s: socketpair(SOCK_STREAM) returned %d, %d",
+@@ -228,7 +243,7 @@
+                   p, strerror(errno));
+ 
+          swarnx("%s: %s", function, emsg);
+-         return NULL;
++         goto connectchild_failed;
+       }
+ 
+       rcvbuf  = (sizeof(childpacket_t)
+@@ -281,7 +296,7 @@
+                   sndbuf, rcvbuf, p, strerror(errno));
+ 
+          swarnx("%s: %s", function, emsg);
+-         return NULL;
++         goto connectchild_failed;
+       }
+ 
+       optlen = sizeof(sndbuf_set);
+@@ -300,7 +315,7 @@
+                   p, strerror(errno));
+ 
+          swarnx("%s: %s", function, emsg);
+-         return NULL;
++         goto connectchild_failed;
+       }
+ 
+       if (sndbuf_set < sndbuf || rcvbuf_set < rcvbuf) {
+@@ -333,7 +348,7 @@
+                   p, strerror(errno));
+ 
+          swarnx("%s: %s", function, emsg);
+-         return NULL;
++         goto connectchild_failed;
+       }
+ 
+       if (sndbuf_set < sndbuf || rcvbuf_set < rcvbuf) {
+@@ -354,7 +369,7 @@
+             snprintf(emsg, emsglen, "fork(2) failed: %s", strerror(errno));
+ 
+             swarnx("%s: %s", function, emsg);
+-            return NULL;
++            goto connectchild_failed;
+ 
+          case 0: {
+             const int maxbadfdc = 256;
+@@ -422,6 +437,10 @@
+       }
+    }
+ 
++#if HAVE_PTHREAD_H
++   pthread_mutex_unlock(&connectchild_mutex);
++#endif /* HAVE_PTHREAD_H */
++
+    /*
+     * Control socket is what later becomes data socket.
+     * We don't want to allow the client to read/write/select etc.
+@@ -713,6 +732,12 @@
+ 
+    ++reqoutstanding;
+    return socksfd.route;
++
++connectchild_failed:
++#if HAVE_PTHREAD_H
++   pthread_mutex_unlock(&connectchild_mutex);
++#endif /* HAVE_PTHREAD_H */
++   return NULL;
+ }
+ 
+ 
+@@ -1449,11 +1474,35 @@
+    errno = errno_s;
+ }
+ 
++/*
++ * SIGIO goes to whichever thread of the program the kernel picks, so several
++ * instances of the handler can run at once, and the handler changes the
++ * address table (socks_addaddr(), dup2() onto the program's fd) that the
++ * program's other threads use too.  Run it with the address lock held: one
++ * instance at a time, and no other thread in the table meanwhile.  An
++ * instance that has to wait still drains the replies, so none is lost.
++ */
+ static void
+ sigio(sig, sip, scp)
+    int sig;
+    siginfo_t *sip;
+    void *scp;
++{
++   const int errno_s = errno;
++   addrlockopaque_t lock;
++
++   socks_addrlock(F_WRLCK, &lock);
++   sigio_locked(sig, sip, scp);
++   socks_addrunlock(&lock);
++
++   errno = errno_s;
++}
++
++static void
++sigio_locked(sig, sip, scp)
++   int sig;
++   siginfo_t *sip;
++   void *scp;
+ {
+    const char *function = "sigio()";
+    const int errno_s = errno;
+--- a/lib/address.c
++++ b/lib/address.c
+@@ -856,7 +856,18 @@
+     * being interrupted by the process used to handle non-blocking connects.
+     * We instead take the risk of not taking the thread-lock in this case.
+     */
++   /*
++    * On other systems, also take it in the signal handler: sockscf.state.
++    * insignal is process-wide, and skipping the lock while any thread is
++    * in sigio() would leave the address table unprotected for every other
++    * thread.  sigio() holds the lock while it runs (connectchild.c), and
++    * the mutex is recursive for the calls it makes.  A thread holding the
++    * lock has all signals blocked (above), so the handler never interrupts
++    * the lock holder.
++    */
++#if defined(__OpenBSD__)
+    if (!sockscf.state.insignal)
++#endif /* __OpenBSD__ */
+       /* XXX set based on locktype. */
+       socks_pthread_mutex_lock(&addrmutex);
+ #endif /* HAVE_PTHREAD_H */
+@@ -868,7 +879,9 @@
+ {
+ 
+ #if HAVE_PTHREAD_H
++#if defined(__OpenBSD__)
+    if (!sockscf.state.insignal)
++#endif /* __OpenBSD__ */
+       socks_pthread_mutex_unlock(&addrmutex);
+ #endif /* HAVE_PTHREAD_H */
+ 
+@@ -1251,9 +1264,10 @@
+          if (socks_pthread_mutexattr_init(&attr) != 0)
+             serr("%s: mutexattr_init() failed", function);
+ 
+-         if (socks_pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK)
++         /* recursive: sigio() holds it while calling functions that lock. */
++         if (socks_pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE)
+          != 0)
+-            swarn("%s: mutex_settype(PTHREAD_MUTEX_ERRORCHECK) failed",
++            swarn("%s: mutex_settype(PTHREAD_MUTEX_RECURSIVE) failed",
+                   function);
+ 
+          if (socks_pthread_mutex_init(&addrmutex, &attr) != 0) {

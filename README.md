@@ -54,11 +54,23 @@ and enforce network policy separately if proxy use is mandatory.
   dropped. `SO_DOMAIN` exposes the new family, and IPv4 options set after
   connection do not affect IPv6 traffic. UDP replies whose source cannot
   be represented as IPv4 are dropped.
+- The threads patch makes non-blocking connects safe in threaded
+  applications: the connect-child is created once even when several threads
+  connect at the same time, and the SIGIO handler, which can run on any
+  thread and on several at once, holds the address-table lock while it
+  works. Without it, threaded applications crash (SIGSEGV/SIGABRT, heap or
+  stack corruption) or lose connects under load.
+- The readv patch fixes `readv(2)` with more than one iovec on proxied
+  sockets, which upstream turned into short reads or received data written
+  over the caller's stack (seen as `__stack_chk_fail` crashes in libevent's
+  `evbuffer_read()`).
 - The library requests a 2 MiB default thread stack for musl, including
   threads in the preloaded application.
 
-See the [IPv6 patch](dante-ipv6-gateway.patch) and
-[worker patch](dante-connectchild-workers.patch) for implementation details.
+See the [worker patch](dante-connectchild-workers.patch),
+[IPv6 patch](dante-ipv6-gateway.patch),
+[threads patch](dante-threads.patch) and
+[readv patch](dante-readv-iovcnt.patch) for implementation details.
 
 ## Build and test
 
@@ -71,8 +83,10 @@ docker build -t dante-client:local .
 
 The build requires IPv4 and IPv6 loopback, including the `ip6-localhost` name,
 in the isolated BuildKit test stage. A blocked connect, unexpected success or
-failure count, pending request, or failed TCP/UDP gateway check stops the
-build. Test tools stay out of the final image.
+failure count, pending request, failed TCP/UDP gateway check, a crash,
+extra connect-child or stall in the multithreaded churn test
+(`test/mtstress.c`), or a short or misplaced `readv(2)`
+(`test/readvcheck.c`) stops the build. Test tools stay out of the final image.
 
 See [image builds and versioning](docs/image-versioning.md) for release tags,
 publication, and Renovate. Repository code is licensed under

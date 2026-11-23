@@ -10,7 +10,7 @@ ARG DANTE_SHA256=1973c7732f1f9f0a4c0ccf2c1ce462c7c25060b25643ea90f9b98f53a813fae
 ARG APORTS=https://raw.githubusercontent.com/alpinelinux/aports/3.24-stable/community/dante
 RUN apk add --no-cache build-base linux-headers curl
 WORKDIR /src
-COPY dante-connectchild-workers.patch dante-ipv6-gateway.patch ./
+COPY dante-connectchild-workers.patch dante-ipv6-gateway.patch dante-threads.patch dante-readv-iovcnt.patch ./
 # Alpine's patches are checked against the sha512sums of the APKBUILD they come with.
 RUN curl -fsSLO "https://www.inet.no/dante/files/dante-${DANTE_VERSION}.tar.gz" \
  && echo "${DANTE_SHA256}  dante-${DANTE_VERSION}.tar.gz" | sha256sum -c - \
@@ -24,7 +24,7 @@ WORKDIR /src/dante-${DANTE_VERSION}
 # overflows that. musl takes the default thread stack size from the largest
 # PT_GNU_STACK among the program and its startup libraries, LD_PRELOAD
 # included, so 2 MiB here applies to every thread of the preloaded program.
-RUN for p in ifdev gaierrval dante-no-bindresvport dante-connectchild-workers dante-ipv6-gateway; do \
+RUN for p in ifdev gaierrval dante-no-bindresvport dante-connectchild-workers dante-ipv6-gateway dante-threads dante-readv-iovcnt; do \
       patch --batch --forward --fuzz=0 -p1 < "../${p}.patch" || exit 1; \
     done \
  && CFLAGS="-Os -fstack-clash-protection -Wformat -Werror=format-security -Wno-implicit-function-declaration -D_GNU_SOURCE" \

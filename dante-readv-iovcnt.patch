@@ -1,0 +1,43 @@
+dante 1.4.4 libdsocks: readv(2) with more than one iovec
+
+Applies on top of dante-threads.patch (any order with the other patches
+works; it only touches Rreadv() in lib/Rcompat.c).
+
+Rreadv() copied the caller's first iovec into a one-element array but set
+msg_iovlen to the caller's iovcnt. For a socksified socket Rrecvmsg() then
+receives into msg_iov[0..iovcnt-1], i.e. it took whatever followed the
+array on Rreadv()'s stack as iovecs and wrote received data to those
+addresses. With libevent (evbuffer_read() reads with up to 4 iovecs) that
+overwrites the caller's frame: musl's stack protector kills the program
+(__stack_chk_fail, "general protection fault ... in ld-musl") as soon as
+data arrives on proxied connections. Rreadv() now passes the caller's
+iovecs.
+
+Test: test/readvcheck.c (via test/run.sh).
+
+--- a/lib/Rcompat.c
++++ b/lib/Rcompat.c
+@@ -203,7 +203,6 @@
+    int iovcnt;
+ {
+    const char *function = "Rreadv()";
+-   struct iovec iov[1] = { { _iov->iov_base, _iov->iov_len } };
+    struct msghdr msg;
+ 
+    clientinit();
+@@ -211,8 +210,14 @@
+    slog(LOG_DEBUG, "%s: fd %d, iovcnt %d", function, d, iovcnt);
+ 
+    bzero(&msg, sizeof(msg));
++   /*
++    * All of the caller's iovecs.  This used a one-element copy of the first
++    * iovec with msg_iovlen = iovcnt, so for iovcnt > 1 Rrecvmsg() took
++    * whatever followed on the stack as further iovecs and wrote received
++    * data there (e.g., into the caller's frame).
++    */
+    /* LINTED operands have incompatible pointer types */
+-   msg.msg_iov      = iov;
++   msg.msg_iov      = (struct iovec *)_iov;
+    msg.msg_iovlen   = iovcnt;
+ 
+    return Rrecvmsg(d, &msg, 0);
