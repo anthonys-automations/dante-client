@@ -1,0 +1,257 @@
+dante 1.4.4 libdsocks: concurrent connect-child, and drain all replies in sigio()
+
+Applies to lib/connectchild.c of dante 1.4.4 (upstream tarball, also on top
+of Alpine's ifdev, gaierrval and dante-no-bindresvport patches).
+
+1. For a non-blocking connect(2), libdsocks connects to the proxy, passes the
+   socket to a forked "connect-child" over a unix datagram socketpair and
+   returns EINPROGRESS. The connect-child negotiates each request serially,
+   in blocking mode. When the proxy is slow to answer CONNECT (seconds, e.g.
+   an anonymizing network or a distant proxy), the datagram queue from the
+   mother fills, and the mother's sendmsgn() of the next request blocks
+   without a timeout: the application thread that called connect(2) hangs.
+   In an event-loop program that is the loop thread, so the whole program
+   stops responding while it sits idle.
+   The connect-child now forks one worker per request:
+   - at most SOCKS_CONNECTCHILD_MAXWORKERS (default 128) at a time; past
+     that, the connect fails immediately (ECONNREFUSED, socket shut down)
+     instead of queueing;
+   - a worker gives up after SOCKS_CONNECTCHILD_TIMEOUT seconds (default
+     30): SIGALRM shuts the socket down, so the blocking negotiation reads
+     EOF and the normal failure reply goes to the mother.
+   If fork(2) fails, the request is negotiated inline as before.
+
+2. sigio() stopped reading replies after the first failed one. SIGIOs
+   coalesce, so replies that arrived together with it stayed queued until
+   another reply raised SIGIO, and their connects stayed "in progress"
+   forever. It now continues with the next reply. Serial negotiation spaces
+   replies out and mostly hides this; concurrent workers make it common.
+
+Test: test/run.sh.
+
+--- a/lib/connectchild.c
++++ b/lib/connectchild.c
+@@ -83,6 +83,24 @@
+ static struct sigaction       originalhandler;
+ static volatile sig_atomic_t  reqoutstanding;
+ 
++/*
++ * Concurrent connect-child.
++ * Upstream negotiates every request serially in the connect-child, and the
++ * mother's sendmsgn() of a new request blocks without a timeout once the
++ * datagram queue to the child is full.  With a slow proxy the queue fills,
++ * and the thread doing the non-blocking connect(2) hangs.  Instead,
++ * the connect-child forks a worker per request (at most
++ * SOCKS_CONNECTCHILD_MAXWORKERS, default 128; beyond that the connect fails
++ * at once), and each worker gives up after SOCKS_CONNECTCHILD_TIMEOUT
++ * seconds (default 30).
++ */
++static volatile sig_atomic_t  connectworkers;
++static int                    connectworkers_max     = 128;
++static int                    connectworker_timeout  = 30;
++static int                    connectworker_control  = -1;
++static void connectworker_reap(int sig);
++static void connectworker_alarm(int sig);
++
+ route_t *
+ socks_nbconnectroute(s, control, packet, src, dst, emsg, emsglen)
+    int s;
+@@ -794,6 +812,24 @@
+ 
+    setproctitle("connectchild");
+ 
++   {
++      struct sigaction sa;
++      const char *v;
++
++      if ((v = getenv("SOCKS_CONNECTCHILD_MAXWORKERS")) != NULL && atoi(v) > 0)
++         connectworkers_max = atoi(v);
++
++      if ((v = getenv("SOCKS_CONNECTCHILD_TIMEOUT")) != NULL && atoi(v) > 0)
++         connectworker_timeout = atoi(v);
++
++      bzero(&sa, sizeof(sa));
++      sigemptyset(&sa.sa_mask);
++      sa.sa_flags   = SA_RESTART | SA_NOCLDSTOP;
++      sa.sa_handler = connectworker_reap;
++      if (sigaction(SIGCHLD, &sa, NULL) != 0)
++         swarn("%s: sigaction(SIGCHLD) failed", function);
++   }
++
+ #if HAVE_GSSAPI
+    gssapistate.value  = gssapistatemem;
+    gssapistate.length = sizeof(gssapistatemem);
+@@ -924,6 +960,7 @@
+          struct msghdr msg;
+          struct timeval tval = { sockscf.timeout.connect, (long)0 };
+          int data, control, ioc, flags, savedforlater;
++         int isworker = 0, overloaded = 0;
+          CMSG_AALLOC(cmsg, sizeof(int) * FDPASS_MAX);
+ 
+          ioc = 0;
+@@ -1013,6 +1050,63 @@
+          slog(LOG_DEBUG, "%s: controlfd %d, datafd %d, req.s fd %d",
+               function, control, data, req.s);
+ 
++         if (connectworkers >= connectworkers_max) {
++            swarnx("%s: all %d connect workers busy, failing connect to %s",
++                   function, connectworkers_max,
++                   sockshost2string(&req.packet.req.host, NULL, 0));
++            overloaded = 1;
++         }
++         else {
++            sigset_t set, oset;
++            pid_t pid;
++
++            sigemptyset(&set);
++            sigaddset(&set, SIGCHLD);
++            sigprocmask(SIG_BLOCK, &set, &oset);
++
++            switch (pid = fork()) {
++               case -1:
++                  swarn("%s: fork() of connect worker failed, "
++                        "negotiating inline", function);
++                  break;
++
++               case 0: {
++                  struct sigaction sa;
++
++                  isworker = 1;
++
++                  bzero(&sa, sizeof(sa));
++                  sigemptyset(&sa.sa_mask);
++                  sa.sa_handler = SIG_DFL;
++                  sigaction(SIGCHLD, &sa, NULL);
++
++                  /*
++                   * negotiation reads block without a timeout; shutdown(2)
++                   * from the alarm handler makes them return EOF.
++                   */
++                  connectworker_control = control;
++                  sa.sa_handler = connectworker_alarm;
++                  sa.sa_flags   = SA_RESTART;
++                  sigaction(SIGALRM, &sa, NULL);
++                  alarm((unsigned int)connectworker_timeout);
++
++                  close(mother_ack);
++                  break;
++               }
++
++               default:
++                  ++connectworkers;
++                  break;
++            }
++
++            sigprocmask(SIG_SETMASK, &oset, NULL);
++
++            if (pid > 0) {
++               close(control);
++               continue;
++            }
++         }
++
+          /*
+           * set a default failure now, in case we don't even get a valid
+           * response from the server.
+@@ -1035,6 +1129,17 @@
+           * a non-blocking socket, so set it to blocking while we
+           * use it.
+           */
++         if (overloaded) {
++            /*
++             * the client sees a failed connect through the socket itself,
++             * as when the proxy closes it after a failure reply.
++             */
++            shutdown(control, SHUT_RDWR);
++            flags                = -1;
++            req.packet.state.err = ECONNREFUSED;
++            goto negotiated;
++         }
++
+          flags = setblocking(control, "socket used for proxy negotiation");
+ 
+          errno = 0;
+@@ -1149,6 +1254,10 @@
+             }
+          }
+ 
++         if (isworker)
++            alarm(0);
++
++negotiated:
+          /* back to original. */
+          if (flags != -1)
+             if (fcntl(control, F_SETFL, flags) == -1)
+@@ -1195,6 +1304,15 @@
+          CMSG_SETHDR_SEND(msg, cmsg, sizeof(int) * fdsent);
+ 
+          savedforlater = 0;
++         if (isworker) {
++            /* nothing to save it for: wait until mother has room. */
++            if (sendmsgn(mother_data, &msg, 0, -1) == -1)
++               swarn("%s: worker failed to send response to mother for %s",
++                     function, sockshost2string(&req.packet.req.host, NULL, 0));
++
++            _exit(EXIT_SUCCESS);
++         }
++
+          if (sendmsgn(mother_data, &msg, 0, 0) == -1) {
+             void *tmp;
+ 
+@@ -1294,6 +1412,31 @@
+ }
+ 
+ static void
++connectworker_reap(sig)
++   int sig;
++{
++   const int errno_s = errno;
++
++   while (waitpid(-1, NULL, WNOHANG) > 0)
++      if (connectworkers > 0)
++         --connectworkers;
++
++   errno = errno_s;
++}
++
++static void
++connectworker_alarm(sig)
++   int sig;
++{
++   const int errno_s = errno;
++
++   if (connectworker_control != -1)
++      shutdown(connectworker_control, SHUT_RDWR);
++
++   errno = errno_s;
++}
++
++static void
+ sigio(sig, sip, scp)
+    int sig;
+    siginfo_t *sip;
+@@ -1645,7 +1788,10 @@
+          };
+ 
+          signalslog(LOG_WARNING, msgv);
+-         break;
++
++         /* next reply, not out of the loop. */
++         CMSG_SETHDR_RECV(msg, cmsg, CMSG_MEMSIZE(cmsg));
++         continue;
+       }
+ 
+       socksfd.state.err = childres.packet.state.err;
+@@ -1824,8 +1970,11 @@
+          /*
+           * XXX If it's a server error it would be nice to retry, could
+           * be there's a backup route.
++          *
++          * Continue with the next reply, not out of the loop.
+           */
+-         break;
++         CMSG_SETHDR_RECV(msg, cmsg, CMSG_MEMSIZE(cmsg));
++         continue;
+       }
+ 
+       if (1) {
