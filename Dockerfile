@@ -7,7 +7,7 @@
 FROM docker.io/library/alpine:3.24 AS dante
 ARG DANTE_VERSION=1.4.4
 ARG DANTE_SHA256=1973c7732f1f9f0a4c0ccf2c1ce462c7c25060b25643ea90f9b98f53a813faec
-ARG APORTS=https://gitlab.alpinelinux.org/alpine/aports/-/raw/3.24-stable/community/dante
+ARG APORTS=https://raw.githubusercontent.com/alpinelinux/aports/3.24-stable/community/dante
 RUN apk add --no-cache build-base linux-headers curl
 WORKDIR /src
 COPY dante-connectchild-workers.patch ./
