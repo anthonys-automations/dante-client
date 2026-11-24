@@ -21,6 +21,7 @@ cc -O2 -o "$W/gaicheck" "$D/gaicheck.c"
 cc -O2 -o "$W/epollcheck" "$D/epollcheck.c"
 cc -O2 -o "$W/bindcheck" "$D/bindcheck.c"
 cc -O2 -pthread -o "$W/getsockcheck" "$D/getsockcheck.c"
+cc -O2 -o "$W/udpdropcheck" "$D/udpdropcheck.c"
 
 srv() { # GATEWAY DELAY FAIL_EVERY HOST [UDP_HOST]
   stop_server
@@ -91,6 +92,13 @@ ep() { # epoll registrations survive libdsocks replacing the socket
   srv "$GW" 1 0 "$HOST"
   client 20 "$W/epollcheck" 20
 }
+ud() { # the server ends a UDP association; the next datagram needs a new one
+  echo "## UDP association ended by the server via $GW"
+  export SLOWSOCKS_UDP_TTL=2
+  srv "$GW" 0 0 "$HOST"
+  unset SLOWSOCKS_UDP_TTL
+  client 30 "$W/udpdropcheck" 4
+}
 gs() { # getsockname(2) right after a non-blocking connect, threaded
   echo "## getsockname() during non-blocking connects from 4 threads via $GW"
   srv "$GW" 1 0 "$HOST"
@@ -123,6 +131,7 @@ for HOST in 127.0.0.1 ::1; do
   rv
   ep
   gs
+  ud
 done
 
 gai

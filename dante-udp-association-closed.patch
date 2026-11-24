@@ -1,0 +1,103 @@
+dante 1.4.4 libdsocks: set up a new UDP association when the server ends one
+
+Applies on top of the other dante-*.patch files (lib/udp.c only).
+
+A UDP ASSOCIATE lasts as long as its TCP control connection (RFC 1928):
+when the server closes that (idle timeout, restart, ...) it also drops the
+relay. udpsetup() reused the association for every later sendto()/recv*()
+on the program's socket without looking at the control connection, so after
+that the program's datagrams went to a relay that no longer existed, for as
+long as the socket lived (with transmission: no DHT, uTP or UDP trackers
+until a restart).
+
+udpsetup() now checks the control connection whenever it reuses an
+association (a non-blocking MSG_PEEK; the server sends nothing on it, so
+EOF or an error means it is gone). If it is, the entry is dropped and a new
+association is set up, starting from the program's own socket family if
+dante-ipv6-gateway.patch had replaced the socket to reach the server.
+
+Test: test/udpdropcheck.c (via test/run.sh; slowsocks.py SLOWSOCKS_UDP_TTL).
+
+--- a/lib/udp.c
++++ b/lib/udp.c
+@@ -759,6 +759,39 @@
+    return 0;
+ }
+ 
++static int
++udpassociation_closed(const socksfd_t *socksfd);
++/*
++ * Returns true if the proxy server has closed the control connection of the
++ * UDP association "socksfd", i.e., the association is gone.
++ */
++
++static int
++udpassociation_closed(socksfd)
++   const socksfd_t *socksfd;
++{
++   const int errno_s = errno;
++   ssize_t rc;
++   char c;
++   int closed;
++
++   if (socksfd->control == -1)
++      return 0;   /* direct, or no control connection. */
++
++   /* the server sends nothing on it; readable means EOF or an error. */
++   rc = recv(socksfd->control, &c, sizeof(c), MSG_PEEK | MSG_DONTWAIT);
++
++   if (rc == 0)
++      closed = 1;
++   else if (rc == -1)
++      closed = !ERRNOISTMP(errno);
++   else
++      closed = 0;
++
++   errno = errno_s;
++   return closed;
++}
++
+ route_t *
+ udpsetup(s, to, type, shouldconnect, emsg, emsglen)
+    int s;
+@@ -809,8 +842,38 @@
+     */
+    if (socks_addrisours(s, &socksfd, 1)) {
+       if (socksfd.state.command == SOCKS_UDPASSOCIATE) {
+-         slog(LOG_DEBUG, "%s: things already set up for fd %d", function, s);
+-         return socksfd.route;
++         if (!udpassociation_closed(&socksfd)) {
++            slog(LOG_DEBUG, "%s: things already set up for fd %d",
++                 function, s);
++            return socksfd.route;
++         }
++
++         /*
++          * The association lasts only as long as its control connection
++          * (RFC 1928), and the server has closed that: its relay is gone.
++          * Set up a new one, starting from the program's own socket family
++          * (we may have replaced the socket to reach this server).
++          */
++         slog(LOG_INFO, "%s: proxy server closed the UDP association of fd "
++                        "%d, setting up a new one",
++              function, s);
++
++         if (socksfd.origfamily != AF_UNSPEC
++         &&  TOSA(&addr)->sa_family != socksfd.origfamily) {
++            if (socks_resocket(s, socksfd.origfamily) != 0) {
++               snprintf(emsg, emsglen,
++                        "could not replace fd %d with an %s socket again: %s",
++                        s, AFNAME(socksfd.origfamily), strerror(errno));
++               return NULL;
++            }
++
++            len = sizeof(addr);
++            if (getsockname(s, TOSA(&addr), &len) != 0) {
++               snprintf(emsg, emsglen, "getsockname(s) failed: %s",
++                        strerror(errno));
++               return NULL;
++            }
++         }
+       }
+       else
+          slog(LOG_DEBUG, "%s: socket was previously used for command %s",

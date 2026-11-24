@@ -9,8 +9,13 @@ UDP ASSOCIATE relays on UDP_HOST (default HOST) and echoes every datagram
 back as if from its destination. A datagram to port 6666 is first answered
 from 2001:db8::1 (an IPv6 source, which an AF_INET program can not see),
 then echoed as usual.
+
+SLOWSOCKS_UDP_TTL=N (environment) ends every UDP association after N seconds:
+the server closes its control connection and the relay, as servers do on
+idle timeouts or restarts.
 """
 import asyncio
+import os
 import ipaddress
 import struct
 import sys
@@ -89,7 +94,11 @@ async def handle(reader, writer):
             bnd = relay.get_extra_info("sockname")
             writer.write(b"\x05\x00\x00" + socksaddr(bnd[0], bnd[1]))
             await writer.drain()
-            await reader.read()
+            ttl = float(os.environ.get("SLOWSOCKS_UDP_TTL", "0"))
+            try:
+                await asyncio.wait_for(reader.read(), ttl if ttl > 0 else None)
+            except asyncio.TimeoutError:
+                pass  # finally: closes the relay and the control connection
             return
         count += 1
         n = count

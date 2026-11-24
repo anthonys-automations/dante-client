@@ -10,8 +10,8 @@ configuration in later layers.
 The `Build and Publish Image` workflow publishes `linux/amd64` and `linux/arm64`
 images to Docker Hub. It runs:
 
-- on changes to `Dockerfile`, `dante-connectchild-workers.patch` or
-  `dante-ipv6-gateway.patch` on `main`;
+- on changes to `Dockerfile`, any `dante-*.patch`, the tests under `test/`
+  or the workflow itself on `main`;
 - every Sunday at 00:00 UTC, to rebuild from the pinned Alpine release tag;
 - when manually dispatched.
 
@@ -25,14 +25,17 @@ The release workflow requires repository secrets `DOCKERHUB_USERNAME` and
 allocates tags as:
 
 ```text
-<UTC YYYY.MM.DD>.<GitHub workflow run number>
+<UTC YYYY.MM.DD>.<n>
 ```
 
-For example, `2026.11.23.42`. The workflow run number provides a unique,
-increasing sequence for this workflow. Before building, it checks that the tag
-does not already exist and fails closed if the registry cannot verify that.
-Rerunning a workflow for an already-published tag will fail; start a new
-workflow run to allocate a new tag.
+where `n` counts that day's releases, starting at 1: `2026.11.24.1`,
+`2026.11.24.2`, ..., then `2026.11.25.1`. The workflow takes `n` from the
+tags already in the registry (the highest of the day plus one), so a run that
+fails before publishing does not use up a number. Releases run one at a time
+(workflow concurrency group), and before building the workflow still checks
+that the tag does not exist yet. It fails closed if the registry cannot list
+the tags or verify the new one. Rerunning a run whose tag has meanwhile been
+published fails; start a new run to allocate the next tag.
 
 The published image includes these OCI labels:
 

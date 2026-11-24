@@ -7,8 +7,8 @@ on:
       - main
     paths:
       - Dockerfile
-      - dante-connectchild-workers.patch
-      - dante-ipv6-gateway.patch
+      - dante-*.patch
+      - test/**
       - .github/workflows/build-image.yml
   schedule:
     - cron: '0 0 * * 0'
@@ -49,13 +49,39 @@ jobs:
             exit 1
           fi
 
-          version="$(date -u +'%Y.%m.%d').${GITHUB_RUN_NUMBER}"
           auth_token=$(curl -fsS \
             --user "${DOCKERHUB_USERNAME}:${DOCKERHUB_TOKEN}" \
             --get \
             --data-urlencode 'service=registry.docker.io' \
             --data-urlencode "scope=repository:${IMAGE}:pull" \
             https://auth.docker.io/token | jq -er '.token')
+
+          # <UTC date>.<n>: n counts this day's releases, from 1. Taken from
+          # the tags already published (the registry pages tags/list; follow
+          # its Link headers). The concurrency group above runs one release
+          # at a time, and the check below still refuses an existing tag.
+          today="$(date -u +'%Y.%m.%d')"
+          tags=""
+          url="https://registry-1.docker.io/v2/${IMAGE}/tags/list?n=1000"
+          headers=$(mktemp)
+          while [[ -n "${url}" ]]; do
+            list_status=$(curl -sS -D "${headers}" -o "${headers}.body" -w '%{http_code}' \
+              -H "Authorization: Bearer ${auth_token}" "${url}")
+            if [[ "${list_status}" == 404 ]]; then
+              break  # repository not created yet: no tags
+            elif [[ "${list_status}" != 200 ]]; then
+              echo "::error::Could not list tags of ${IMAGE} (registry returned HTTP ${list_status})."
+              exit 1
+            fi
+            tags+=$(jq -r '.tags // [] | .[]' "${headers}.body")$'\n'
+            next=$(grep -i '^link:' "${headers}" | sed -E 's/^[^<]*<([^>]+)>.*/\1/' | tr -d '\r' || true)
+            url=${next:+https://registry-1.docker.io${next}}
+          done
+          rm -f "${headers}" "${headers}.body"
+          last=$(grep -E "^${today//./\\.}\.[0-9]+$" <<< "${tags}" | awk -F. '{ print $4 }' | sort -n | tail -n 1 || true)
+          version="${today}.$(( ${last:-0} + 1 ))"
+          echo "Release tag: ${version} (previous today: ${last:-none})"
+
           status=$(curl -sS -o /dev/null -w '%{http_code}' \
             -H "Authorization: Bearer ${auth_token}" \
             -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
