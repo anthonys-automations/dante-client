@@ -1,0 +1,341 @@
+dante 1.4.4 libdsocks: keep the program's epoll registrations when a socket
+is replaced
+
+Applies on top of the other dante-*.patch files.
+
+libdsocks replaces the socket behind a program's descriptor with dup2(2):
+for every non-blocking connect (the program gets a placeholder, and the
+socket connected to the proxy is dup2()ed onto it when the negotiation
+finishes), and with dante-ipv6-gateway.patch whenever an IPv4 socket has to
+become IPv6 to reach the proxy (TCP and the UDP data socket). epoll(7)
+registrations belong to the open file, not the descriptor number, so they
+vanish with the old socket. Programs that use epoll (libevent, libuv, most
+event loops on Linux) are then never told that a non-blocking connect
+finished, or that UDP data arrived: proxied connections never complete and
+received datagrams pile up unread. Programs using select(2) or poll(2)
+pass the descriptor on every call and are not affected.
+
+libdsocks now interposes epoll_ctl(2) (not socksified, only recorded;
+exported via include/symbols_preload.txt) and
+remembers each registration with the identity (st_dev/st_ino) of the file
+registered. socks_dup2(), used wherever libdsocks replaces one of the
+program's sockets, registers the new socket with the same epoll instances,
+events and data. Only registrations of the file being replaced move, so a
+stale entry for a closed and reused descriptor does not. Linux only.
+
+Limitation: a registration the program made *before* a non-blocking
+connect(2) stays attached to the original socket, which libdsocks keeps
+for the negotiation; such programs may see events for it early. Event loops
+normally register after connect() returns EINPROGRESS.
+
+Test: test/epollcheck.c (via test/run.sh).
+
+--- a/include/common.h
++++ b/include/common.h
+@@ -3065,6 +3065,28 @@
+ 
+ int
+ socks_bind(int s, struct sockaddr_storage *addr, size_t retries);
++
++#if SOCKS_CLIENT && defined(__linux__)
++struct epoll_event;
++int
++socks_epoll_ctl(int (*sys)(int, int, int, struct epoll_event *),
++                int epfd, int op, int fd, struct epoll_event *event);
++/*
++ * epoll_ctl(2) through "sys" (the system's), remembering the program's
++ * registrations, so socks_dup2() can carry them over to a replacement
++ * socket.
++ */
++#endif /* SOCKS_CLIENT && __linux__ */
++
++int
++socks_dup2(int oldfd, int newfd);
++/*
++ * dup2(2) for replacing the socket behind one of the program's descriptors
++ * with another socket (newfd keeps its number).  On Linux, the program's
++ * epoll(7) registrations of newfd move along: they belong to the old open
++ * file, so without this the program is never told about events on the new
++ * socket (e.g., that a non-blocking connect finished).
++ */
+ /*
+  * Binds the address "addr" to the socket "s".  The bind call will
+  * be tried "retries" + 1 times if the error is EADDRINUSE, or until
+--- a/include/symbols_preload.txt
++++ b/include/symbols_preload.txt
+@@ -2,6 +2,7 @@
+ bind
+ bindresvport
+ connect
++epoll_ctl
+ freehostent
+ getaddrinfo
+ gethostbyname
+--- a/lib/socket.c
++++ b/lib/socket.c
+@@ -56,6 +56,165 @@
+  */
+ #endif /* SOCKS_CLIENT */
+ 
++#if SOCKS_CLIENT && defined(__linux__)
++#include <sys/epoll.h>
++
++/*
++ * The program's epoll registrations: epoll keys them by descriptor *and*
++ * open file, so they disappear when we dup2() another socket onto the
++ * descriptor.  Kept with the identity of the file registered, so a stale
++ * entry (descriptor closed and reused) is never carried over.  Protected by
++ * the address lock, which sigio() holds too.
++ */
++typedef struct {
++   int                epfd;
++   int                fd;
++   dev_t              dev;
++   ino_t              ino;
++   struct epoll_event event;
++} epollreg_t;
++
++static epollreg_t *epollregv;
++static size_t     epollregc, epollregmax;
++static int        (*sys_epoll_ctl_fn)(int, int, int, struct epoll_event *);
++
++static int
++fdidentity(const int fd, dev_t *dev, ino_t *ino);
++
++static int
++fdidentity(fd, dev, ino)
++   const int fd;
++   dev_t *dev;
++   ino_t *ino;
++{
++   struct stat st;
++
++   if (fstat(fd, &st) != 0)
++      return -1;
++
++   *dev = st.st_dev;
++   *ino = st.st_ino;
++
++   return 0;
++}
++
++int
++socks_epoll_ctl(sys, epfd, op, fd, event)
++   int (*sys)(int, int, int, struct epoll_event *);
++   int epfd;
++   int op;
++   int fd;
++   struct epoll_event *event;
++{
++   addrlockopaque_t lock;
++   size_t i;
++   dev_t dev;
++   ino_t ino;
++   int rc, errno_s;
++
++   /* the call and the bookkeeping together, so socks_dup2() sees both. */
++   socks_addrlock(F_WRLCK, &lock);
++
++   sys_epoll_ctl_fn = sys;
++   rc               = sys(epfd, op, fd, event);
++   errno_s          = errno;
++
++   if (rc == 0) {
++      for (i = 0; i < epollregc; ++i)
++         if (epollregv[i].epfd == epfd && epollregv[i].fd == fd)
++            break;
++
++      if (op == EPOLL_CTL_DEL || event == NULL
++      ||  fdidentity(fd, &dev, &ino) != 0) {
++         if (i < epollregc)
++            epollregv[i] = epollregv[--epollregc];
++      }
++      else {
++         if (i == epollregc) {
++            if (epollregc == epollregmax) {
++               const size_t newmax = epollregmax == 0 ? 64 : epollregmax * 2;
++               epollreg_t *p;
++
++               if ((p = realloc(epollregv, newmax * sizeof(*p))) == NULL) {
++                  /* can not remember it; it just will not be carried over. */
++                  socks_addrunlock(&lock);
++                  errno = errno_s;
++                  return rc;
++               }
++
++               epollregv   = p;
++               epollregmax = newmax;
++            }
++
++            ++epollregc;
++         }
++
++         epollregv[i].epfd  = epfd;
++         epollregv[i].fd    = fd;
++         epollregv[i].dev   = dev;
++         epollregv[i].ino   = ino;
++         epollregv[i].event = *event;
++      }
++   }
++
++   socks_addrunlock(&lock);
++
++   errno = errno_s;
++   return rc;
++}
++#endif /* SOCKS_CLIENT && __linux__ */
++
++int
++socks_dup2(oldfd, newfd)
++   int oldfd;
++   int newfd;
++{
++#if SOCKS_CLIENT && defined(__linux__)
++   addrlockopaque_t lock;
++   size_t i;
++   dev_t dev;
++   ino_t ino;
++   int rc, errno_s, haveold;
++
++   socks_addrlock(F_WRLCK, &lock);
++
++   haveold = epollregc > 0 && fdidentity(newfd, &dev, &ino) == 0;
++
++   rc      = dup2(oldfd, newfd);
++   errno_s = errno;
++
++   if (rc != -1 && haveold) {
++      for (i = 0; i < epollregc; ) {
++         epollreg_t *r = &epollregv[i];
++
++         if (r->fd != newfd || r->dev != dev || r->ino != ino) {
++            ++i;
++            continue;
++         }
++
++         /* registered with the file we just replaced: register the new one. */
++         if (sys_epoll_ctl_fn(r->epfd, EPOLL_CTL_ADD, newfd, &r->event) == 0
++         ||  errno == EEXIST) {
++            (void)fdidentity(newfd, &r->dev, &r->ino);
++            ++i;
++         }
++         else  /* epoll fd gone, or the like. */
++            epollregv[i] = epollregv[--epollregc];
++      }
++   }
++
++   socks_addrunlock(&lock);
++
++   errno = errno_s;
++   return rc;
++
++#else /* !(SOCKS_CLIENT && __linux__) */
++
++   return dup2(oldfd, newfd);
++
++#endif /* !(SOCKS_CLIENT && __linux__) */
++}
++
+ int
+ socks_connecthost(s,
+ #if !SOCKS_CLIENT
+@@ -501,7 +660,7 @@
+             return -1;
+          }
+ 
+-         if (dup2(new_s, s) == -1) {
++         if (socks_dup2(new_s, s) == -1) {
+             snprintf(emsg, emsglen, "dup2() failed: %s", strerror(errno));
+             close(new_s);
+ 
+@@ -934,7 +1093,7 @@
+                  "%s: found socket duped by client, fd %d is dup of fd %d",
+                  function, i, s);
+ 
+-            if (dup2(new_s, i) == -1) {
++            if (socks_dup2(new_s, i) == -1) {
+                snprintf(emsg, emsglen,
+                         "could not dup2(2) fd %d to %d (for clients dup): %s",
+                         new_s, i, strerror(errno));
+@@ -953,7 +1112,7 @@
+ 
+ #endif /* SOCKS_CLIENT */
+ 
+-      rc = dup2(new_s, s);
++      rc = socks_dup2(new_s, s);
+       close(new_s);
+ 
+       if (rc == -1) {
+--- a/lib/connectchild.c
++++ b/lib/connectchild.c
+@@ -502,7 +502,7 @@
+       return NULL;
+    }
+ 
+-   if (dup2(control, s) == -1) { /* give the client the dummy socket. */
++   if (socks_dup2(control, s) == -1) { /* give the client the dummy socket. */
+       snprintf(emsg, emsglen, "could not dup2(2) control-fd %d: %s",
+                control, strerror(errno));
+ 
+@@ -1892,7 +1892,7 @@
+                signalslog(LOG_DEBUG, msgv);
+             }
+ 
+-            if (dup2(socksfd.control, s) == -1) {
++            if (socks_dup2(socksfd.control, s) == -1) {
+                const char *msgv[] =
+                { function,
+                  ": ",
+--- a/lib/sockopt.c
++++ b/lib/sockopt.c
+@@ -277,7 +277,7 @@
+            sockaddr2string(&local, NULL, 0),
+            AFNAME(af));
+ 
+-   if (dup2(new_s, s) == -1)
++   if (socks_dup2(new_s, s) == -1)
+       goto fail;
+ 
+    close(new_s);
+--- a/dlib/interposition.c
++++ b/dlib/interposition.c
+@@ -3102,6 +3102,39 @@
+ #endif /* SOCKS_CLIENT */
+ 
+ 
++#if SOCKS_CLIENT && defined(__linux__)
++#include <sys/epoll.h>
++
++/*
++ * Not socksified: interposed only so that socks_dup2() can keep the
++ * program's epoll registrations when we replace a socket behind one of its
++ * descriptors (non-blocking connect, IPv6 proxy server).
++ */
++int
++epoll_ctl(epfd, op, fd, event)
++   int epfd;
++   int op;
++   int fd;
++   struct epoll_event *event;
++{
++   static int (*sys)(int, int, int, struct epoll_event *);
++
++   if (sys == NULL
++   &&  (sys = (int (*)(int, int, int, struct epoll_event *))
++              dlsym(RTLD_NEXT, "epoll_ctl")) == NULL) {
++      errno = ENOSYS;
++      return -1;
++   }
++
++   if (doing_addrinit || sockscf.state.executingdnscode)
++      return sys(epfd, op, fd, event);
++
++   clientinit();
++
++   return socks_epoll_ctl(sys, epfd, op, fd, event);
++}
++#endif /* SOCKS_CLIENT && __linux__ */
++
+ static libsymbol_t *
+ libsymbol(symbol)
+    const char *symbol;

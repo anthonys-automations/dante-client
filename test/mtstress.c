@@ -13,7 +13,10 @@
  * MTSTRESS_ABORT_AT=N raises SIGTRAP after N seconds, to inspect the
  * threads under a debugger.
  */
+#define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <dlfcn.h>
+#include <ucontext.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -109,6 +112,31 @@ static int children(void)
    return n;
 }
 
+/* on a crash, say where (library + offset), for addr2line on a debug build. */
+static void crashed(int sig, siginfo_t *si, void *uc)
+{
+   char buf[256];
+   void *pc = NULL;
+   Dl_info di;
+   int n;
+
+#if defined(__x86_64__)
+   pc = (void *)((ucontext_t *)uc)->uc_mcontext.gregs[REG_RIP];
+#elif defined(__aarch64__)
+   pc = (void *)((ucontext_t *)uc)->uc_mcontext.pc;
+#endif
+   if (pc != NULL && dladdr(pc, &di) && di.dli_fname != NULL)
+      n = snprintf(buf, sizeof(buf), "CRASH: signal %d at %s+%#lx (fault address %p)\n",
+                   sig, di.dli_fname,
+                   (unsigned long)((char *)pc - (char *)di.dli_fbase), si->si_addr);
+   else
+      n = snprintf(buf, sizeof(buf), "CRASH: signal %d at %p (fault address %p)\n",
+                   sig, pc, si->si_addr);
+   write(1, buf, n > 0 ? (size_t)n : 0);
+   signal(sig, SIG_DFL);
+   raise(sig);
+}
+
 int main(int argc, char **argv)
 {
    int threads = argc > 1 ? atoi(argv[1]) : 4;
@@ -120,6 +148,16 @@ int main(int argc, char **argv)
       maxwait_ms = atoi(argv[3]);
 
    signal(SIGPIPE, SIG_IGN); /* as daemons do */
+   {
+      struct sigaction sa;
+
+      memset(&sa, 0, sizeof(sa));
+      sa.sa_sigaction = crashed;
+      sa.sa_flags     = SA_SIGINFO;
+      sigaction(SIGSEGV, &sa, NULL);
+      sigaction(SIGBUS, &sa, NULL);
+      sigaction(SIGABRT, &sa, NULL);
+   }
 
    tid = calloc(threads, sizeof(*tid));
    for (i = 0; i < threads; ++i)

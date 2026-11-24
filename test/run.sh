@@ -18,6 +18,9 @@ cc -O2 -o "$W/v6check" "$D/v6check.c"
 cc -O2 -pthread -o "$W/mtstress" "$D/mtstress.c"
 cc -O2 -o "$W/readvcheck" "$D/readvcheck.c"
 cc -O2 -o "$W/gaicheck" "$D/gaicheck.c"
+cc -O2 -o "$W/epollcheck" "$D/epollcheck.c"
+cc -O2 -o "$W/bindcheck" "$D/bindcheck.c"
+cc -O2 -pthread -o "$W/getsockcheck" "$D/getsockcheck.c"
 
 srv() { # GATEWAY DELAY FAIL_EVERY HOST [UDP_HOST]
   stop_server
@@ -45,6 +48,16 @@ client() { # TIME_LIMIT [ENV...] PROGRAM ARGS...
       tail -n 20 "$W/socks.log" "$W/client.err" >&2
       exit "$rc"
     }
+  # libdsocks' helpers (connect-child, workers) must go when the program
+  # does; one left behind is stuck (e.g., on a lock inherited at fork()).
+  for _ in $(seq 20); do
+    pgrep -f "^$W/" >/dev/null || return 0
+    sleep 0.5
+  done
+  echo "FAIL: libdsocks helper processes left behind:" >&2
+  ps -o pid,args | grep "$W/" | grep -v grep >&2
+  pkill -9 -f "^$W/"
+  exit 1
 }
 
 t() { # DELAY FAIL_EVERY N WAIT EXPECTED_SUCCESSES MIN_SECONDS [ENV...]
@@ -54,11 +67,34 @@ t() { # DELAY FAIL_EVERY N WAIT EXPECTED_SUCCESSES MIN_SECONDS [ENV...]
   client "$((wait + 5))" "$@" "$W/nbconnect" "$n" "$wait" "$ok" "$min"
 }
 
+bp() { # IPv4 wildcard bind with a port that is taken in IPv6
+  echo "## connect via ::1 from 0.0.0.0:P with [::]:P taken"
+  srv ::1 0 0 ::1
+  # binds go to the kernel, as in a program's config.
+  printf 'route {\n  from: 0.0.0.0/0 to: 0.0.0.0/0 via: direct\n  command: bind\n}\n' >> "$W/socks.conf"
+  client 20 "$W/bindcheck"
+  # it must not need Rconnect()'s EADDRINUSE workaround to get there.
+  if grep -q 'Address in use' "$W/client.err"; then
+    echo "FAIL: replacing the socket hit EADDRINUSE:" >&2
+    grep 'Address in use' "$W/client.err" | head -3 >&2
+    exit 1
+  fi
+}
 gai() { # numeric IPv6 addresses with the fake resolver
   echo "## getaddrinfo() with resolveprotocol: fake"
   { echo "resolveprotocol: fake"; cat "$D/socks.conf"; } > "$W/socks.conf"
   timeout 20 env SOCKS_CONF="$W/socks.conf" LD_PRELOAD="$LIB" "$W/gaicheck" \
     2> "$W/client.err" || { cat "$W/client.err" >&2; exit 1; }
+}
+ep() { # epoll registrations survive libdsocks replacing the socket
+  echo "## 20 non-blocking connects watched with epoll via $GW"
+  srv "$GW" 1 0 "$HOST"
+  client 20 "$W/epollcheck" 20
+}
+gs() { # getsockname(2) right after a non-blocking connect, threaded
+  echo "## getsockname() during non-blocking connects from 4 threads via $GW"
+  srv "$GW" 1 0 "$HOST"
+  client 30 "$W/getsockcheck" 4 5
 }
 rv() { # readv(2) with several iovecs on a proxied socket
   echo "## readv() with 4 iovecs via $GW"
@@ -85,9 +121,12 @@ for HOST in 127.0.0.1 ::1; do
   t 6 0 500 20 128 0
   mt
   rv
+  ep
+  gs
 done
 
 gai
+bp
 v6 127.0.0.1 127.0.0.1 127.0.0.1 4 4
 v6 ::1 ::1 ::1 6 6
 v6 ::1 ::1 127.0.0.1 6 4

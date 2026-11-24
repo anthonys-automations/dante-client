@@ -1,0 +1,70 @@
+dante 1.4.4 libdsocks: getsockname(2) on a non-blocking connect in progress
+must not wait for SIGIO
+
+Applies on top of the other dante-*.patch files (it only touches
+Rgetsockname() in lib/Rgetsockname.c).
+
+For a socket whose non-blocking connect through the proxy is still in
+progress, Rgetsockname() waited with sigsuspend() for the SIGIO that
+completes it, then retried. SIGIO goes to any thread of the program, so in a
+threaded program the waiting thread may never get it and hangs for good.
+libcurl calls getsockname() right after connect(): with transmission every
+HTTP tracker announce stayed "in progress" for as long as the daemon ran
+(its web thread sat in sigsuspend()). It now answers like the kernel does
+for a connect in progress, with the descriptor's current local address; the
+proxy's address for us is not known yet at that point anyway.
+
+Test: test/getsockcheck.c (via test/run.sh).
+
+--- a/lib/Rgetsockname.c
++++ b/lib/Rgetsockname.c
+@@ -141,34 +141,23 @@
+ 
+             if (socksfd.state.inprogress) { /* non-blocking connect. */
+                /*
+-                * this is bad.  We don't know what address the socks server
+-                * will use on our behalf yet.  Lets wait for a SIGIO
+-                * and then retry, unless client is blocking that signal,
+-                * then we can only hope the client will retry on ENOBUFS,
+-                * but we are probably screwed anyway.
+-               */
+-               if (sigismember(&oset, SIGIO)) {
+-                  swarnx("%s: SIGIO is being blocked by client", function);
+-
+-                  if (sigprocmask(SIG_BLOCK, &oset, NULL) != 0) {
+-                     swarn("%s: sigprocmask()", function);
+-                     return -1;
+-                  }
+-
+-                  errno = ENOBUFS;
+-                  return -1;
+-               }
+-
+-
+-               slog(LOG_DEBUG, "%s: waiting for signal from child", function);
+-               sigsuspend(&oset); /* wait for sigchld. */
+-
+-               if (sigprocmask(SIG_BLOCK, &oset, NULL) != 0) {
++                * We do not know yet what address the socks server will use
++                * on our behalf.  This used to wait here with sigsuspend()
++                * for the SIGIO that completes the connect, but SIGIO goes
++                * to any thread of the program: in a threaded program that
++                * one may never come to this thread, which then hangs (e.g.
++                * libcurl calls getsockname() right after connect()).
++                * Answer like the kernel does for a connect in progress:
++                * with the descriptor's current local address.
++                */
++               if (sigprocmask(SIG_SETMASK, &oset, NULL) != 0)
+                   swarn("%s: sigprocmask()", function);
+-                  return -1;
+-               }
+ 
+-               return Rgetsockname(s, name, namelen);
++               slog(LOG_DEBUG, "%s: fd %d: connect in progress, returning "
++                               "its current local address",
++                    function, s);
++
++               return getsockname(s, name, namelen);
+             }
+ 
+             if (sigprocmask(SIG_SETMASK, &oset, NULL) != 0)

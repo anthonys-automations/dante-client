@@ -1,0 +1,44 @@
+dante 1.4.4 libdsocks: replacing a socket for an IPv6 proxy must not fail
+on the source port
+
+Applies on top of dante-ipv6-gateway.patch (and the other dante-*.patch
+files).
+
+socks_resocket() keeps the port of a socket the program bound to the IPv4
+wildcard address with a fixed port, by binding the replacement IPv6 socket
+to [::]:port. That port is free in IPv4, not necessarily in IPv6: e.g., a
+program that binds every outgoing socket to "0.0.0.0" gets kernel-picked
+ephemeral ports, and under load some of them are in use by IPv6 sockets.
+The bind then failed, the connect to the proxy failed with EADDRINUSE, and
+Rconnect() went into its "server socksified?" workaround. The replacement
+socket only connects to the proxy server, where the source port does not
+matter, so it is now left unbound when that bind fails. (The UDP data
+socket keeps its own fallback to any port.)
+
+Test: test/bindcheck.c (via test/run.sh).
+
+--- a/lib/sockopt.c
++++ b/lib/sockopt.c
+@@ -262,11 +262,17 @@
+ 
+       SET_SOCKADDRPORT(&newlocal, GET_SOCKADDRPORT(&local));
+ 
+-      if (bind(new_s, TOSA(&newlocal), salen(newlocal.ss_family)) == -1) {
+-         swarn("%s: could not bind %s for fd %d",
+-               function, sockaddr2string(&newlocal, NULL, 0), s);
+-         goto fail;
+-      }
++      if (bind(new_s, TOSA(&newlocal), salen(newlocal.ss_family)) == -1)
++         /*
++          * The port is free in the old family, not necessarily in the new
++          * one (e.g., an ephemeral port the kernel picked for the program's
++          * IPv4 socket).  The new socket only connects to the proxy server,
++          * where the source port does not matter: leave it unbound.
++          */
++         slog(LOG_DEBUG, "%s: could not bind %s for fd %d (%s), leaving the "
++                         "new socket unbound",
++              function, sockaddr2string(&newlocal, NULL, 0), s,
++              strerror(errno));
+    }
+    else if (IPADDRISBOUND(&local))
+       slog(LOG_DEBUG,

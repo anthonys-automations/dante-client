@@ -1,0 +1,76 @@
+dante 1.4.4 libdsocks: connect-child forked while another thread holds the
+address lock
+
+Applies on top of dante-threads.patch (and the other dante-*.patch files).
+
+The connect-child is fork(2)ed from the program on its first non-blocking
+connect. In a threaded program another thread may hold the address mutex
+at that moment; the child inherits it locked, with no thread left to unlock
+it, and blocks for good on its first socks_addrlock(). It then stops
+reading requests, the program's next connects block in sendmsgn() once the
+queue to the child is full, and the program freezes (transmission: RPC
+dead, restarted by its liveness probe). dante-threads.patch makes this
+likely, because sigio() and every other thread now really take the mutex.
+The child now re-creates the mutex first thing after fork().
+
+Test: test/getsockcheck.c, test/mtstress.c (via test/run.sh). run.sh also
+fails if a test leaves a libdsocks helper process behind.
+
+--- a/include/common.h
++++ b/include/common.h
+@@ -3078,6 +3078,13 @@
+  */
+ #endif /* SOCKS_CLIENT && __linux__ */
+ 
++void
++socks_addrlock_afterfork(void);
++/*
++ * To be called first thing in a child forked from a threaded program: the
++ * address lock may have been held by another thread at fork(2) time.
++ */
++
+ int
+ socks_dup2(int oldfd, int newfd);
+ /*
+--- a/lib/address.c
++++ b/lib/address.c
+@@ -874,6 +874,27 @@
+ }
+ 
+ void
++socks_addrlock_afterfork(void)
++{
++#if HAVE_PTHREAD_H
++   pthread_mutexattr_t attr;
++
++   /*
++    * In a process forked from a threaded program (the connect-child), the
++    * address mutex may have been held by another thread at fork(2) time,
++    * and nothing would ever unlock it here.  Only this thread exists now.
++    */
++   if (!sockscf.state.threadlockenabled)
++      return;
++
++   if (socks_pthread_mutexattr_init(&attr) != 0
++   ||  socks_pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE) != 0
++   ||  socks_pthread_mutex_init(&addrmutex, &attr) != 0)
++      (void)socks_pthread_mutex_init(&addrmutex, NULL);
++#endif /* HAVE_PTHREAD_H */
++}
++
++void
+ socks_addrunlock(lock)
+    const addrlockopaque_t *lock;
+ {
+--- a/lib/connectchild.c
++++ b/lib/connectchild.c
+@@ -375,6 +375,9 @@
+             const int maxbadfdc = 256;
+             int i, maxfd, badfdc;
+ 
++            /* before anything that might take the address lock. */
++            socks_addrlock_afterfork();
++
+             slog(LOG_INFO,
+                  "%s: connectchild forked, our pid is %ld, mother is %ld",
+                  function, (long)getpid(), (long)getppid());

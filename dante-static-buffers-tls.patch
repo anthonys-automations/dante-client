@@ -1,0 +1,356 @@
+dante 1.4.4 libdsocks: per-thread result buffers for the string helpers
+
+Applies on top of the other dante-*.patch files (lib/tostring.c, lib/util.c
+and lib/ipv6.c only).
+
+The address/protocol-to-string helpers (sockaddr2string(), sockshost2string(),
+socket2string() and friends) write into a function-static buffer when the
+caller passes none, as libdsocks does throughout its logging. Threads of the
+program (and sigio(), which runs on any of them) format into the same buffer
+at once: garbled log lines, and snprintfn()'s check that its output is
+NUL-terminated aborts the program ("an internal error was detected at
+../lib/util.c:..., expression \"str[rc] == NUL\""), seen with test/mtstress.c.
+The buffers are thread-local now. (A signal handler interrupting the same
+helper on the same thread could still clobber it, as before.)
+
+Test: test/mtstress.c (via test/run.sh).
+
+--- a/lib/tostring.c
++++ b/lib/tostring.c
+@@ -57,7 +57,7 @@
+    size_t buflen;
+ {
+    if (buf == NULL || buflen == 0) {
+-      static char _buf[64];
++      static __thread char _buf[64];
+ 
+       buf    = _buf;
+       buflen = sizeof(_buf);
+@@ -87,7 +87,7 @@
+    int i, rc;
+ 
+    if (buf == NULL || buflen == 0) {
+-      static char _buf[10240];
++      static __thread char _buf[10240];
+ 
+       buf    = _buf;
+       buflen = sizeof(_buf);
+@@ -121,7 +121,7 @@
+    long portnumber;
+ 
+    if (emsg == NULL || emsglen == 0) {
+-      static char _emsg[256];
++      static __thread char _emsg[256];
+ 
+       emsg    = _emsg;
+       emsglen = sizeof(_emsg);
+@@ -160,7 +160,7 @@
+    size_t strused;
+ 
+    if (strsize == 0) {
+-      static char buf[256];
++      static __thread char buf[256];
+ 
+       str = buf;
+       strsize = sizeof(buf);
+@@ -202,7 +202,7 @@
+    size_t strused;
+ 
+    if (strsize == 0) {
+-      static char buf[16];
++      static __thread char buf[16];
+ 
+       str = buf;
+       strsize = sizeof(buf);
+@@ -228,7 +228,7 @@
+      const void *packet;
+      int isrequest;
+ {
+-   static char buf[1024];
++   static __thread char buf[1024];
+    char hstr[MAXSOCKSHOSTSTRING];
+    unsigned char version;
+    const request_t *request = NULL;
+@@ -390,7 +390,7 @@
+    ssize_t lenused;
+ 
+    if (string == NULL || len == 0) {
+-      static char addrstring[MAXRULEADDRSTRING];
++      static __thread char addrstring[MAXRULEADDRSTRING];
+ 
+       string = addrstring;
+       len    = sizeof(addrstring);
+@@ -592,7 +592,7 @@
+    size_t strused;
+ 
+    if (strsize == 0) {
+-      static char buf[128];
++      static __thread char buf[128];
+ 
+       str = buf;
+       strsize = sizeof(buf);
+@@ -713,7 +713,7 @@
+    size_t i;
+ 
+    if (strsize == 0) {
+-      static char buf[512];
++      static __thread char buf[512];
+ 
+       str     = buf;
+       strsize = sizeof(buf);
+@@ -768,7 +768,7 @@
+    char visbuf[sizeof(*host) * 4];
+ 
+    if (string == NULL || len == 0) {
+-      static char hstr[sizeof(visbuf)];
++      static __thread char hstr[sizeof(visbuf)];
+ 
+       string = hstr;
+       len    = sizeof(hstr);
+@@ -860,7 +860,7 @@
+    size_t len;
+ {
+    if (string == NULL || len == 0) {
+-      static char addrstring[MAXSOCKADDRSTRING];
++      static __thread char addrstring[MAXSOCKADDRSTRING];
+ 
+       string = addrstring;
+       len    = sizeof(addrstring);
+@@ -881,7 +881,7 @@
+    size_t lenused = 0;
+ 
+    if (string == NULL || len == 0) {
+-      static char addrstring[MAX(MAXSOCKADDRSTRING, 256)];
++      static __thread char addrstring[MAX(MAXSOCKADDRSTRING, 256)];
+ 
+       string = addrstring;
+       len    = sizeof(addrstring);
+@@ -959,7 +959,7 @@
+    size_t len;
+ {
+    if (string == NULL || len == 0) {
+-      static char stringmem[sizeof(IP6_FMTSTR)];
++      static __thread char stringmem[sizeof(IP6_FMTSTR)];
+ 
+       string = stringmem;
+       len    = sizeof(stringmem);
+@@ -1029,7 +1029,7 @@
+    size_t strused;
+ 
+    if (strsize == 0) {
+-      static char buf[16];
++      static __thread char buf[16];
+ 
+       str = buf;
+       strsize = sizeof(buf);
+@@ -1070,7 +1070,7 @@
+    socklen_t len;
+ 
+    if (buflen == 0) {
+-      static char sbuf[256];
++      static __thread char sbuf[256];
+ 
+       buf    = sbuf;
+       buflen = sizeof(sbuf);
+@@ -1103,7 +1103,7 @@
+    socklen_t len;
+ 
+    if (buflen == 0) {
+-      static char sbuf[256];
++      static __thread char sbuf[256];
+ 
+       buf    = sbuf;
+       buflen = sizeof(sbuf);
+@@ -1139,7 +1139,7 @@
+    int val;
+ 
+    if (buflen == 0) {
+-      static char sbuf[256];
++      static __thread char sbuf[256];
+ 
+       buf    = sbuf;
+       buflen = sizeof(sbuf);
+@@ -1225,7 +1225,7 @@
+          return "AF_LOCAL";
+ 
+       default: {
+-         static char buf[sizeof("unknown socket address family: 65535")];
++         static __thread char buf[sizeof("unknown socket address family: 65535")];
+ 
+          snprintf(buf, sizeof(buf), "<unknown socket address family: %d>", af);
+          return buf;
+@@ -1266,7 +1266,7 @@
+ 
+    if (buf == NULL || buflen == 0) {
+       /* for a 64 bits integer. */
+-      static char bufmem[(sizeof("-") - 1) + sizeof("18446744073709551616")];
++      static __thread char bufmem[(sizeof("-") - 1) + sizeof("18446744073709551616")];
+ 
+       buf    = bufmem;
+       buflen = sizeof(bufmem);
+@@ -1345,7 +1345,7 @@
+    size_t strused;
+ 
+    if (strsize == 0) {
+-      static char buf[512];
++      static __thread char buf[512];
+ 
+       str = buf;
+       strsize = sizeof(buf);
+@@ -1375,7 +1375,7 @@
+    size_t i;
+ 
+    if (strsize == 0) {
+-      static char buf[512];
++      static __thread char buf[512];
+ 
+       str = buf;
+       strsize = sizeof(buf);
+@@ -1711,7 +1711,7 @@
+    size_t strused;
+ 
+    if (strsize == 0) {
+-      static char buf[100];
++      static __thread char buf[100];
+ 
+       str     = buf;
+       strsize = sizeof(buf);
+@@ -1835,7 +1835,7 @@
+    size_t strused;
+ 
+    if (strsize == 0) {
+-      static char buf[1024];
++      static __thread char buf[1024];
+ 
+       str     = buf;
+       strsize = sizeof(buf);
+@@ -1930,7 +1930,7 @@
+ {
+ 
+    if (strsize == 0) {
+-      static char buf[1024];
++      static __thread char buf[1024];
+ 
+       str     = buf;
+       strsize = sizeof(buf);
+@@ -1953,7 +1953,7 @@
+ {
+ 
+    if (strsize == 0) {
+-      static char buf[1024];
++      static __thread char buf[1024];
+ 
+       str     = buf;
+       strsize = sizeof(buf);
+@@ -2028,7 +2028,7 @@
+    size_t strused;
+ 
+    if (strsize == 0) {
+-      static char buf[1024];
++      static __thread char buf[1024];
+ 
+       str     = buf;
+       strsize = sizeof(buf);
+@@ -2148,7 +2148,7 @@
+    size_t strused;
+ 
+    if (strsize == 0) {
+-      static char buf[1024];
++      static __thread char buf[1024];
+ 
+       str = buf;
+       strsize = sizeof(buf);
+@@ -2206,7 +2206,7 @@
+    size_t strused;
+ 
+    if (strsize == 0) {
+-      static char buf[128];
++      static __thread char buf[128];
+ 
+       str = buf;
+       strsize = sizeof(buf);
+@@ -2318,7 +2318,7 @@
+    size_t strused;
+ 
+    if (strsize == 0) {
+-      static char buf[32];
++      static __thread char buf[32];
+ 
+       str = buf;
+       strsize = sizeof(buf);
+@@ -2345,7 +2345,7 @@
+    size_t strused;
+ 
+    if (strsize == 0) {
+-      static char buf[32];
++      static __thread char buf[32];
+ 
+       str = buf;
+       strsize = sizeof(buf);
+@@ -2413,7 +2413,7 @@
+    size_t strused;
+ 
+    if (strsize == 0) {
+-      static char buf[64];
++      static __thread char buf[64];
+ 
+       str = buf;
+       strsize = sizeof(buf);
+@@ -2488,7 +2488,7 @@
+    size_t i, strused;
+ 
+    if (strsize == 0) {
+-      static char buf[2048];
++      static __thread char buf[2048];
+ 
+       str     = buf;
+       strsize = sizeof(buf);
+@@ -2517,7 +2517,7 @@
+    size_t strused;
+ 
+    if (strsize == 0) {
+-      static char buf[128];
++      static __thread char buf[128];
+ 
+       str = buf;
+       strsize = sizeof(buf);
+@@ -2549,7 +2549,7 @@
+    const int version;
+    const int code;
+ {
+-   static char prefix[16], buf[64];
++   static __thread char prefix[16], buf[64];
+ 
+    SASSERTX(version == PROXY_HTTP_10
+    ||       version == PROXY_HTTP_11);
+--- a/lib/util.c
++++ b/lib/util.c
+@@ -716,7 +716,7 @@
+    size_t nocompare;
+ 
+    if (ifname == NULL || iflen == 0) {
+-      static char ifname_mem[MAXIFNAMELEN];
++      static __thread char ifname_mem[MAXIFNAMELEN];
+ 
+       ifname = ifname_mem;
+       iflen  = sizeof(ifname_mem);
+@@ -913,7 +913,7 @@
+ {
+    const char *function = "socks_mklock()";
+    const char *prefix;
+-   static char newtemplate[PATH_MAX];
++   static __thread char newtemplate[PATH_MAX];
+    size_t len;
+    int s, flag;
+ 
+--- a/lib/ipv6.c
++++ b/lib/ipv6.c
+@@ -159,7 +159,7 @@
+ socks_gai_strerror(errcode)
+    int errcode;
+ {
+-   static char emsg[1024];
++   static __thread char emsg[1024];
+ 
+ #if !SOCKS_CLIENT
+    int isaflimit = 0, hasaf = 0;
