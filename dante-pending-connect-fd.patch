@@ -1,0 +1,158 @@
+dante 1.4.4 libdsocks: a non-blocking connect the program gives up on
+
+Applies on top of the other dante-*.patch files.
+
+For a non-blocking connect(2) libdsocks gives the program a placeholder
+socket and keeps the real one (connected to the proxy, being negotiated by
+the connect-child) as the entry's control descriptor; sigio() dup2()s it
+onto the program's descriptor when the negotiation finishes. libdsocks does
+not interpose close(2), and programs routinely close sockets whose connect
+takes too long. Then:
+
+- sigio() dup2()ed the proxy socket onto the closed descriptor's number
+  anyway, i.e. over whatever the program had opened under that number
+  since: with transmission, the files it downloads into ("Invalid seek" on
+  pwrite(), data received but never written, torrents not progressing);
+- nothing ever closed the control descriptor: the daemon accumulated tens of
+  thousands of sockets (CLOSE-WAIT to the proxy, and closed ones).
+
+The entry now records the identity (st_dev/st_ino) of the placeholder.
+sigio() only completes the connect if the program's descriptor is still
+that socket; otherwise it drops the entry. socks_rmaddr() closes the control
+descriptor of a connect still in progress, a new connect on a reused
+number frees a stale entry's control descriptor, and socks_addrisours() no
+longer takes a reused descriptor for the old connect in progress.
+
+Test: test/fdreusecheck.c (via test/run.sh).
+
+--- a/include/common.h
++++ b/include/common.h
+@@ -2355,6 +2355,16 @@
+                                      * by one of the server's family.
+                                      * AF_UNSPEC if not known.
+                                      */
++   dev_t        pendingdev;         /*
++                                     * identity (st_dev/st_ino) of the
++                                     * placeholder socket the program holds
++                                     * while its non-blocking connect is in
++                                     * progress; 0 if none.  If the program's
++                                     * descriptor is no longer that socket,
++                                     * the program has closed it (and may have
++                                     * reused the number for something else).
++                                     */
++   ino_t        pendingino;
+ 
+    union {
+       sockshost_t   accepted;   /* address server accepted for us.     */
+--- a/lib/address.c
++++ b/lib/address.c
+@@ -403,7 +403,18 @@
+                break;
+ 
+             case SOCKS_CONNECT:
+-               break; /* no separate control connection. */
++               /*
++                * No separate control connection once connected.  While a
++                * non-blocking connect is in progress there is one: the
++                * socket negotiating with the proxy, which the program does
++                * not have (its descriptor is a placeholder).  Nobody else
++                * will close it.
++                */
++               if (socksfdv[d].state.inprogress
++               &&  socksfdv[d].control != -1
++               &&  socksfdv[d].control != d)
++                  close(socksfdv[d].control);
++               break;
+ 
+             case SOCKS_UDPASSOCIATE:
+                if (socksfdv[d].control != -1)
+@@ -549,6 +560,20 @@
+             break;
+          }
+ 
++         if (socksfd.state.command == SOCKS_CONNECT
++         &&  socksfd.state.inprogress
++         &&  socksfd.pendingino != 0) {
++            struct stat st;
++
++            if (fstat(s, &st) != 0
++            ||  st.st_dev != socksfd.pendingdev
++            ||  st.st_ino != socksfd.pendingino) {
++               breakreason = "descriptor is no longer the placeholder of the "
++                             "connect in progress (closed and reused)";
++               break;
++            }
++         }
++
+          if (!IPADDRISBOUND(&socksfd.local)) {
+             /*
+              * if address was not bound before, it might have become
+--- a/lib/connectchild.c
++++ b/lib/connectchild.c
+@@ -664,6 +664,30 @@
+     */
+    socksfd.control             = control;
+    socksfd.origfamily          = socksfd.local.ss_family;
++
++   {
++      socksfd_t old;
++      struct stat st;
++
++      /*
++       * An earlier connect on this descriptor number still in progress
++       * means the program closed that socket and got the number again:
++       * that connect's control socket is ours alone to close.
++       */
++      if (socks_getaddr(s, &old, 1) != NULL
++      &&  old.state.command == SOCKS_CONNECT
++      &&  old.state.inprogress
++      &&  old.control != -1
++      &&  old.control != s
++      &&  old.control != control)
++         close(old.control);
++
++      /* s is the placeholder now; remember which socket it is. */
++      if (fstat(s, &st) == 0) {
++         socksfd.pendingdev = st.st_dev;
++         socksfd.pendingino = st.st_ino;
++      }
++   }
+    socksfd.state.command       = packet->req.command;
+    socksfd.state.version       = packet->req.version;
+    socksfd.state.protocol.tcp  = 1;
+@@ -1859,6 +1883,35 @@
+          continue;
+       }
+ 
++      if (socksfd.state.inprogress && socksfd.pendingino != 0) {
++         struct stat st;
++
++         if (fstat(s, &st) != 0
++         ||  st.st_dev != socksfd.pendingdev
++         ||  st.st_ino != socksfd.pendingino) {
++            /*
++             * The program has closed the placeholder, and the number may
++             * be in use for something else (a file, a new socket) by now:
++             * never dup2() over it.  Drop the connect, closing our control
++             * socket (socks_rmaddr()).
++             */
++            const char *msgv[] =
++            { function,
++              ": ",
++              "fd ",
++              ltoa((long)s, b[0], sizeof(b[0])),
++              " is no longer the placeholder of this connect; dropping it",
++              NULL
++            };
++
++            signalslog(LOG_DEBUG, msgv);
++
++            socks_rmaddr(s, 0);
++            CMSG_SETHDR_RECV(msg, cmsg, CMSG_MEMSIZE(cmsg));
++            continue;
++         }
++      }
++
+       socksfd.state.err = childres.packet.state.err;
+ 
+       switch (socksfd.state.version) {
