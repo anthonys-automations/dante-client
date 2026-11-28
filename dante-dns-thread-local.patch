@@ -1,0 +1,139 @@
+dante 1.4.4 libdsocks: "executing resolver code" per thread
+
+Applies on top of the other dante-*.patch files.
+
+libdsocks lets the system resolver's own socket calls go native: the
+sys_getaddrinfo()/sys_gethostbyname*()/sys_getnameinfo()/... wrappers
+increment sockscf.state.executingdnscode around the real call, and every
+interposed call (connect(2) included) goes to the kernel unproxied while
+it is non-zero (socks_shouldcallasnative()). That counter was one for the
+whole process, updated with plain ++/-- from any thread:
+
+- while one thread was resolving, every other thread's connects, binds,
+  sends, ... went native as well (unproxied; with no route out they fail,
+  otherwise they leak);
+- racing ++/-- from two threads can lose an update and leave it non-zero
+  for good: from then on libdsocks proxies nothing. With transmission, after
+  a burst of UDP tracker lookups every peer and tracker connect went to the
+  kernel and failed with ENETUNREACH, and downloads stopped for good.
+
+It is a thread-local now (socks_executingdnscode), so only the resolving
+thread's own calls go native.
+
+Test: test/dnsracecheck.c (via test/run.sh).
+
+--- a/include/common.h
++++ b/include/common.h
+@@ -3095,6 +3095,16 @@
+  * address lock may have been held by another thread at fork(2) time.
+  */
+ 
++/*
++ * Per thread: non-zero while this thread runs the system resolver for us
++ * (sys_getaddrinfo() and friends), whose own socket calls must not be
++ * socksified.  Was sockscf.state.executingdnscode, shared by all threads:
++ * one thread resolving made every thread's calls go native, and racing
++ * ++/-- could leave it non-zero for good (libdsocks then passes every
++ * connect(2) to the kernel unproxied).
++ */
++extern __thread ssize_t socks_executingdnscode;
++
+ int
+ socks_dup2(int oldfd, int newfd);
+ /*
+--- a/lib/util.c
++++ b/lib/util.c
+@@ -1461,6 +1461,8 @@
+    return saddr;
+ }
+ 
++__thread ssize_t socks_executingdnscode;
++
+ #undef snprintf
+ size_t
+ snprintfn(char *str, size_t size, const char *format, ...)
+--- a/lib/clientprotocol.c
++++ b/lib/clientprotocol.c
+@@ -368,8 +368,8 @@
+           * up closing and recreating it.
+           */
+ 
+-         SASSERTX(sockscf.state.executingdnscode >= 0);
+-         if (sockscf.state.executingdnscode
++         SASSERTX(socks_executingdnscode >= 0);
++         if (socks_executingdnscode
+          &&  s != control
+             /* workaround is only usable for udp. */
+          &&  packet->req.command == SOCKS_UDPASSOCIATE)
+--- a/lib/gssapi.c
++++ b/lib/gssapi.c
+@@ -71,13 +71,13 @@
+ #define DNSCODE_START()                                                        \
+ do {                                                                           \
+       slog(LOG_DEBUG, "DNSCODE_START: %d",                                     \
+-           (int)++sockscf.state.executingdnscode);                             \
++           (int)++socks_executingdnscode);                             \
+ } while (/* CONSTCOND */ 0)
+ 
+ #define DNSCODE_END()                                                          \
+ do {                                                                           \
+       slog(LOG_DEBUG, "DNSCODE_END: %d",                                       \
+-           (int)--sockscf.state.executingdnscode);                             \
++           (int)--socks_executingdnscode);                             \
+ } while (/* CONSTCOND */ 0)
+ 
+ 
+--- a/dlib/interposition.c
++++ b/dlib/interposition.c
+@@ -380,13 +380,13 @@
+ #define DNSCODE_START()                                                        \
+ do {                                                                           \
+       slog(LOG_DEBUG,                                                          \
+-           "DNSCODE_START: %d", (int)++sockscf.state.executingdnscode);        \
++           "DNSCODE_START: %d", (int)++socks_executingdnscode);        \
+ } while (/* CONSTCOND */ 0)
+ 
+ #define DNSCODE_END()                                                          \
+ do {                                                                           \
+       slog(LOG_DEBUG,                                                          \
+-           "DNSCODE_END: %d", (int)--sockscf.state.executingdnscode);    \
++           "DNSCODE_END: %d", (int)--socks_executingdnscode);    \
+ } while (/* CONSTCOND */ 0)
+ 
+ 
+@@ -458,7 +458,7 @@
+    socksfd_t *p;
+    addrlockopaque_t opaque;
+ 
+-   if (doing_addrinit || sockscf.state.executingdnscode)
++   if (doing_addrinit || socks_executingdnscode)
+       return;
+ 
+    if (s < 0)
+@@ -494,7 +494,7 @@
+    addrlockopaque_t opaque;
+    socksfd_t socksfd, *p;
+ 
+-   if (doing_addrinit || sockscf.state.executingdnscode)
++   if (doing_addrinit || socks_executingdnscode)
+       return;
+ 
+    if (s < 0)
+@@ -624,7 +624,7 @@
+    socks_id_t myid, *fid;
+    libsymbol_t *lib;
+ 
+-   if (doing_addrinit || sockscf.state.executingdnscode)
++   if (doing_addrinit || socks_executingdnscode)
+       return 1;
+ 
+    lib = libsymbol(symbol);
+@@ -3130,7 +3130,7 @@
+       return -1;
+    }
+ 
+-   if (doing_addrinit || sockscf.state.executingdnscode)
++   if (doing_addrinit || socks_executingdnscode)
+       return sys(epfd, op, fd, event);
+ 
+    clientinit();

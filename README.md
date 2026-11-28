@@ -88,6 +88,15 @@ and enforce network policy separately if proxy use is mandatory.
   server closes that (idle timeout, restart), libdsocks sets up a new
   association on the next datagram instead of sending to a relay that is
   gone.
+- A non-blocking connect the application gives up on (closes while the
+  proxy negotiation runs) is dropped cleanly: libdsocks no longer `dup2()`s
+  the finished proxy socket over the reused descriptor number (it could
+  replace a file the application had opened since) and closes its own
+  socket for it.
+- "Running the system resolver" is tracked per thread. It used to be one
+  process-wide counter: while any thread resolved, every thread's socket
+  calls went native (unproxied), and racing updates could leave it set for
+  good, after which nothing was proxied any more.
 - The library requests a 2 MiB default thread stack for musl, including
   threads in the preloaded application.
 
@@ -100,9 +109,10 @@ See the [worker patch](dante-connectchild-workers.patch),
 [getsockname patch](dante-getsockname-inprogress.patch),
 [fork patch](dante-fork-addrlock.patch),
 [string buffers patch](dante-static-buffers-tls.patch),
-[resocket bind patch](dante-resocket-bind-fallback.patch) and
-[UDP association patch](dante-udp-association-closed.patch) for
-implementation details.
+[resocket bind patch](dante-resocket-bind-fallback.patch),
+[UDP association patch](dante-udp-association-closed.patch),
+[pending connect patch](dante-pending-connect-fd.patch) and
+[resolver patch](dante-dns-thread-local.patch) for implementation details.
 
 ## Build and test
 
@@ -123,7 +133,10 @@ extra connect-child or stall in the multithreaded churn test
 (`test/epollcheck.c`), a `getsockname()` that blocks (`test/getsockcheck.c`),
 a socket replacement that hits EADDRINUSE (`test/bindcheck.c`), a UDP socket
 left without an association after the server ended it
-(`test/udpdropcheck.c`), or a libdsocks helper process left behind stops the
+(`test/udpdropcheck.c`), a reused descriptor clobbered or a socket leaked
+after an abandoned connect (`test/fdreusecheck.c`, `test/stalecheck.c`), a
+connect that goes unproxied while other threads resolve
+(`test/dnsracecheck.c`), or a libdsocks helper process left behind stops the
 build. Test tools stay out of the final image.
 
 See [image builds and versioning](docs/image-versioning.md) for release tags,

@@ -23,6 +23,8 @@ cc -O2 -o "$W/bindcheck" "$D/bindcheck.c"
 cc -O2 -pthread -o "$W/getsockcheck" "$D/getsockcheck.c"
 cc -O2 -o "$W/udpdropcheck" "$D/udpdropcheck.c"
 cc -O2 -o "$W/fdreusecheck" "$D/fdreusecheck.c"
+cc -O2 -o "$W/stalecheck" "$D/stalecheck.c"
+cc -O2 -pthread -o "$W/dnsracecheck" "$D/dnsracecheck.c"
 
 srv() { # GATEWAY DELAY FAIL_EVERY HOST [UDP_HOST]
   stop_server
@@ -93,6 +95,16 @@ ep() { # epoll registrations survive libdsocks replacing the socket
   srv "$GW" 1 0 "$HOST"
   client 20 "$W/epollcheck" 20
 }
+dr() { # resolver calls in other threads must not switch proxying off
+  echo "## connects proxied while other threads resolve, via $GW"
+  srv "$GW" 0 0 "$HOST"
+  client 60 "$W/dnsracecheck" 5
+}
+sc() { # numbers of finished, closed connects work for new sockets
+  echo "## connects on reused descriptor numbers after refused connects, via $GW"
+  srv "$GW" 0 1 "$HOST"
+  client 30 "$W/stalecheck" 20
+}
 fr() { # connects given up on while negotiating; their numbers reused for files
   echo "## abandoned non-blocking connects, descriptors reused for files, via $GW"
   srv "$GW" 1 0 "$HOST"
@@ -139,6 +151,8 @@ for HOST in 127.0.0.1 ::1; do
   gs
   ud
   fr
+  dr
+  sc
 done
 
 gai
